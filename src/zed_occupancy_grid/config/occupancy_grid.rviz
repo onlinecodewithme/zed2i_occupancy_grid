@@ -118,7 +118,7 @@ Visualization Manager:
       Median window: 5
       Min Value: 0
       Name: Depth Image
-      Normalize Range: true
+      Normalize Range: false
       Topic:
         Depth: 10
         Durability Policy: Volatile
