@@ -203,13 +203,13 @@ def generate_launch_description():
     ld.add_action(declare_min_depth_cmd)
     ld.add_action(declare_max_depth_cmd)
     
-    # Add the TF setup node first to ensure transforms are published before other nodes start
-    ld.add_action(tf_setup_node)
-    
-    # Add the ZED camera launch description
+    # Add the ZED camera launch description first to set up camera
     ld.add_action(zed_camera_launch)
     
-    # Add our occupancy grid node after TF is set up
+    # Add the TF setup node to ensure transforms are published
+    ld.add_action(tf_setup_node)
+    
+    # Add our occupancy grid node after camera and TF are set up
     ld.add_action(occupancy_grid_node)
     
     # Add RViz2 node (optional, can be commented out if not needed)

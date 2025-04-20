@@ -66,24 +66,24 @@ class ZedOccupancyGridNode(Node):
         # Counter to track number of observations for each cell
         self.observation_count_grid = np.zeros((self.grid_rows, self.grid_cols), dtype=np.int32)
         
-        # Filtering parameters
-        self.temporal_filtering = True        # Enable temporal filtering
-        self.spatial_filtering = True         # Enable spatial filtering
-        self.min_observations = 2             # Reduced minimum observations for faster map updates
-        self.max_ray_length = 5.0             # Maximum ray length for ray casting
+        # Filtering parameters - MORE AGGRESSIVE FOR MOVEMENT
+        self.temporal_filtering = True       # Enable temporal filtering
+        self.spatial_filtering = True        # Enable spatial filtering
+        self.min_observations = 1            # Minimum observations before marking as occupied - reduced to 1
+        self.max_ray_length = 5.0            # Maximum ray length for ray casting
         
-        # Parameters for map updates with camera motion
-        self.last_camera_position = None      # Track camera position to detect movement
-        self.position_change_threshold = 0.05  # Min position change to trigger map update (meters)
-        self.rotation_change_threshold = 0.05  # Min rotation change to trigger update (radians)
-        self.reset_cells_on_movement = False   # Whether to reset cells that become out of view
-        self.camera_motion_detected = False    # Flag to indicate if camera has moved
-        self.last_camera_quaternion = None     # Track camera rotation
+        # Parameters for map updates with camera motion - INCREASED SENSITIVITY
+        self.last_camera_position = None     # Track camera position to detect movement
+        self.position_change_threshold = 0.01 # Very small threshold to detect any movement
+        self.rotation_change_threshold = 0.01 # Very small threshold for rotation detection
+        self.reset_cells_on_movement = False  # Whether to reset cells that become out of view
+        self.camera_motion_detected = False   # Flag to indicate if camera has moved
+        self.last_camera_quaternion = None    # Track camera rotation
         
-        # Camera movement adaptation settings
-        self.static_alpha = 0.9               # Higher temporal filtering when static
-        self.moving_alpha = 0.5               # Lower temporal filtering when moving
-        self.current_alpha = self.static_alpha  # Current alpha value based on motion
+        # Camera movement adaptation settings - MORE RESPONSIVE
+        self.static_alpha = 0.7              # Less temporal filtering even when static (0.7 instead of 0.9)
+        self.moving_alpha = 0.3              # Much less filtering when moving (0.3 instead of 0.5)
+        self.current_alpha = self.moving_alpha # Start with moving settings for faster updates
 
         # Initialize CV bridge for image conversion
         self.cv_bridge = CvBridge()
@@ -103,14 +103,6 @@ class ZedOccupancyGridNode(Node):
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,  # Critical for RViz compatibility
             depth=20
         )
-        
-        # QoS profile for point cloud subscription - to match ZED node settings
-        qos_profile_point_cloud = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,  # Match ZED's publisher durability
-            depth=10
-        )
 
         # Publishers and subscribers
         self.occupancy_grid_pub = self.create_publisher(
@@ -120,11 +112,11 @@ class ZedOccupancyGridNode(Node):
         self.depth_subscriber = self.create_subscription(
             Image, self.depth_topic, self.depth_callback, qos_profile_sub)
             
-        # Add rate limiting with separate update/publish cycles
+        # Add rate limiting with separate update/publish cycles - FASTER UPDATES
         self.last_publish_time = 0.0
-        self.publish_period = 0.2  # Faster publishing (5Hz) for better responsiveness
+        self.publish_period = 0.1            # 10Hz publishing for better responsiveness
         self.last_update_time = 0.0
-        self.update_period = 0.1  # Process depth at 10Hz for better map updates with motion
+        self.update_period = 0.05            # 20Hz processing for immediate updates
         
         # Add a mutex for thread safety
         self.grid_lock = threading.Lock()
@@ -133,16 +125,16 @@ class ZedOccupancyGridNode(Node):
         self.last_grid_msg = None
         
         # Create a timer for regular map updates (even with no new data)
-        self.map_timer = self.create_timer(0.5, self.publish_map_timer_callback)  # 2Hz timer
+        self.map_timer = self.create_timer(0.2, self.publish_map_timer_callback)  # 5Hz timer
 
         # TF buffer and listener
-        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_buffer = tf2_ros.Buffer(rclpy.duration.Duration(seconds=10.0))  # Larger buffer
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.get_logger().info('ZED Occupancy Grid Node initialized')
+        self.get_logger().info('ZED Occupancy Grid Node initialized with MOVEMENT-OPTIMIZED settings')
         self.get_logger().info(f'Listening to depth topic: {self.depth_topic}')
         self.get_logger().info(f'Grid size: {self.grid_width}x{self.grid_height} meters, resolution: {self.resolution} m/cell')
-        self.get_logger().info(f'Motion-adaptive temporal filtering enabled')
+        self.get_logger().info(f'ENHANCED motion-adaptive temporal filtering enabled')
 
     def depth_callback(self, depth_msg):
         try:
@@ -192,11 +184,13 @@ class ZedOccupancyGridNode(Node):
                 # Update the occupancy grid using depth image and transform
                 self.update_grid_from_depth(depth_image, transform)
                 
-                # Publish at the specified rate
-                if current_time - self.last_publish_time >= self.publish_period:
+                # Always publish when camera is moving, or at regular intervals when static
+                camera_pos = transform.transform.translation
+                if self.camera_motion_detected or current_time - self.last_publish_time >= self.publish_period:
                     self.last_publish_time = current_time
                     try:
                         self.publish_occupancy_grid()
+                        self.get_logger().info(f"Published grid, camera pos: ({camera_pos.x:.2f}, {camera_pos.y:.2f}, {camera_pos.z:.2f})")
                     except Exception as e:
                         self.get_logger().error(f"Error publishing occupancy grid: {e}")
                 
@@ -262,7 +256,7 @@ class ZedOccupancyGridNode(Node):
             self.last_grid_msg = grid_msg
             
             # Log the publish with current camera state
-            state = "moving" if self.camera_motion_detected else "static"
+            state = "MOVING" if self.camera_motion_detected else "static"
             self.get_logger().debug(f'Published occupancy grid with frame_id: {grid_msg.header.frame_id} (camera {state})')
 
     def create_grid_msg_from_log_odds(self):
@@ -326,6 +320,7 @@ class ZedOccupancyGridNode(Node):
             
             if position_change > self.position_change_threshold:
                 position_changed = True
+                self.get_logger().info(f"Position changed by {position_change:.4f}m ({dx:.3f}, {dy:.3f}, {dz:.3f})")
                 
         # Calculate rotation change using quaternion dot product
         if self.last_camera_quaternion is not None:
@@ -343,6 +338,7 @@ class ZedOccupancyGridNode(Node):
             
             if angle_diff > self.rotation_change_threshold:
                 rotation_changed = True
+                self.get_logger().info(f"Rotation changed by {angle_diff:.4f} radians")
         
         # Update last known position and rotation
         self.last_camera_position = (camera_x, camera_y, camera_z)
@@ -409,10 +405,9 @@ class ZedOccupancyGridNode(Node):
         # Detect if camera has moved
         is_moving = self.detect_camera_motion(transform)
         
-        # Choose the right sampling grid size based on camera motion
-        # When moving, we use a coarser grid to process faster
-        stride_y = 10 if not is_moving else 20
-        stride_x = 10 if not is_moving else 20
+        # Choose sampling density - always use fine sampling for better detail
+        stride_y = 6  # Fine sampling for better details
+        stride_x = 6  # Fine sampling for better details
         
         # Lock for thread safety
         with self.grid_lock:
@@ -478,6 +473,14 @@ class ZedOccupancyGridNode(Node):
                 # Static camera = more temporal filtering (higher alpha) for stability
                 mask = (current_update != self.LOG_ODDS_PRIOR)  # Only update cells we observed
                 self.log_odds_grid[mask] = self.current_alpha * self.log_odds_grid[mask] + (1-self.current_alpha) * current_update[mask]
+                
+                # When camera is moving, give extra weight to new observations
+                if is_moving:
+                    # Increase the weight of occupied cells in the current view
+                    occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
+                    if np.any(occupied_mask):
+                        # Boost occupied cells to appear faster
+                        self.log_odds_grid[occupied_mask] += 0.3
             else:
                 # Faster but less stable updates - direct addition of log-odds
                 self.log_odds_grid += current_update * (current_update != self.LOG_ODDS_PRIOR)
