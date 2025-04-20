@@ -44,7 +44,7 @@ def generate_launch_description():
     
     declare_min_depth_cmd = DeclareLaunchArgument(
         'min_depth',
-        default_value='0.5',
+        default_value='0.2',
         description='Minimum depth considered (m)')
     
     declare_max_depth_cmd = DeclareLaunchArgument(
@@ -87,6 +87,45 @@ def generate_launch_description():
         'mapping.max_mapping_range': '20.0',
         'mapping.fused_pointcloud_freq': '2.0',
     }
+    # camera_params = {
+    #     'camera_model': camera_model,
+    #     'general.camera_model': camera_model,
+        
+    #     # Depth settings for low light
+    #     'depth.depth_mode': 'ULTRA',  # Try ULTRA instead of NEURAL_LIGHT for low light
+    #     'depth.min_depth': min_depth,
+    #     'depth.max_depth': '10.0',  # Reduce max depth for better accuracy in limited range
+    #     'depth.depth_stabilization': '100',  # Maximum stability
+    #     'depth.point_cloud_freq': '10.0',  # Slightly lower frequency for better quality
+        
+    #     # Camera control for low light
+    #     'video.brightness': '4',  # Increase brightness (default is 4, range 0-8)
+    #     'video.contrast': '4',  # Adjust contrast (default is 4, range 0-8)
+    #     'video.gain': '100',  # Increase gain for low light (range 0-100)
+    #     'video.exposure': '100',  # Increase exposure for low light (range 0-100)
+    #     'video.whitebalance_auto': 'true',  # Auto white balance helps in varying lighting
+        
+    #     # Positional tracking settings
+    #     'pos_tracking.pos_tracking_enabled': 'true',
+    #     'pos_tracking.area_memory': 'true',
+    #     'pos_tracking.imu_fusion': 'true',
+    #     'pos_tracking.floor_alignment': 'true',
+    #     'pos_tracking.depth_min_range': '0.4',  # Slightly higher min range for better reliability
+    #     'pos_tracking.reset_odom_with_loop_closure': 'true',
+    #     'pos_tracking.initial_world_transform': 'GRAVITY',  # Use gravity for initial alignment
+    #     'pos_tracking.set_gravity_as_origin': 'true',
+        
+    #     # SLAM settings optimized for indoor
+    #     'pos_tracking.slam_enabled': 'true',
+    #     'pos_tracking.slam_mode': 'MEDIUM',  # MEDIUM quality is good for indoor
+    #     'pos_tracking.loop_closure_enabled': 'true',
+        
+    #     # Mapping settings
+    #     'mapping.mapping_enabled': 'true',
+    #     'mapping.resolution': resolution,
+    #     'mapping.max_mapping_range': '8.0',  # Reduced range for more accurate indoor mapping
+    #     'mapping.fused_pointcloud_freq': '1.0',  # Lower frequency for better quality
+    # }
 
     # Create the ZED camera launch description
     zed_camera_launch = IncludeLaunchDescription(
@@ -104,7 +143,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'camera_frame': 'zed_left_camera_frame',  # Fixed frame name to match actual ZED camera frame
-            'depth_topic': '/zed/zed_node/depth/depth_registered',  # Fixed topic path to match actual ZED camera output
+            'depth_topic': '/zed/zed_node/depth/depth_registered',  # Verified correct topic from ZED node
             'min_depth': min_depth,
             'max_depth': max_depth,
             'resolution': resolution,  # Controls grid cell size - smaller values give more detail

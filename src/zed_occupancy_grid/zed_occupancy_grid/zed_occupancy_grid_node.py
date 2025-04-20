@@ -101,36 +101,47 @@ class ZedOccupancyGridNode(Node):
             grid_msg.info.origin.position.z = 0.0
             grid_msg.info.origin.orientation.w = 1.0  # No rotation
 
-                # Initialize grid data with all unknown cells (-1)
-            grid_msg.data = [-1] * (self.grid_cols * self.grid_rows)
+                # Initialize grid data with all FREE cells (0) instead of unknown for better visibility
+            grid_msg.data = [0] * (self.grid_cols * self.grid_rows)
             
             # Force some test cells to be occupied to verify grid is working
-            # Create a simple pattern in the center of the grid
+            # Create a large visible pattern - a cross through the middle
             center_x = self.grid_cols // 2
             center_y = self.grid_rows // 2
+            pattern_size = min(self.grid_cols, self.grid_rows) // 3
             
-            # Create a 3x3 pattern of occupied cells in the center
-            for dx in range(-5, 6):
-                for dy in range(-5, 6):
-                    if abs(dx) + abs(dy) <= 5:  # Diamond pattern
-                        x = center_x + dx
-                        y = center_y + dy
-                        if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
-                            index = y * self.grid_cols + x
-                            grid_msg.data[index] = 100  # Mark as occupied
+            # Draw horizontal line
+            for dx in range(-pattern_size, pattern_size + 1):
+                x = center_x + dx
+                y = center_y
+                if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
+                    index = y * self.grid_cols + x
+                    grid_msg.data[index] = 100  # Mark as occupied
             
-            # Add a square outline
-            for dx in range(-10, 11):
-                for dy in range(-10, 11):
-                    if abs(dx) == 10 or abs(dy) == 10:  # Create a square outline
-                        x = center_x + dx
-                        y = center_y + dy
-                        if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
-                            index = y * self.grid_cols + x
-                            grid_msg.data[index] = 100  # Mark as occupied
-                            
+            # Draw vertical line
+            for dy in range(-pattern_size, pattern_size + 1):
+                x = center_x
+                y = center_y + dy
+                if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
+                    index = y * self.grid_cols + x
+                    grid_msg.data[index] = 100  # Mark as occupied
+            
+            # Draw a box around the perimeter as a test pattern
+            border = 10  # cells from edge
+            for x in range(border, self.grid_cols - border):
+                for y in [border, self.grid_rows - border - 1]:
+                    if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
+                        index = y * self.grid_cols + x
+                        grid_msg.data[index] = 100
+                        
+            for y in range(border, self.grid_rows - border):
+                for x in [border, self.grid_cols - border - 1]:
+                    if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
+                        index = y * self.grid_cols + x
+                        grid_msg.data[index] = 100
+                        
             # Publish the grid with the test pattern
-            self.get_logger().info("Publishing test occupancy grid pattern")
+            self.get_logger().info("Publishing test occupancy grid pattern with frame_id: " + grid_msg.header.frame_id)
             self.occupancy_grid_pub.publish(grid_msg)
             
             # Try to get transform from camera to map
