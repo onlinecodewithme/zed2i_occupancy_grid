@@ -66,12 +66,19 @@ def generate_launch_description():
         'camera_model': camera_model,
         'general.camera_model': camera_model,
         
-        # Depth settings
+        # QoS settings to fix point cloud compatibility
+        'general.pub_frame_rate': '10.0',    # Lower rate for stability
+        'general.qos_depth': '10',           # Increase queue size
+        'general.qos_history': '1',          # 1 = KEEP_LAST
+        'general.qos_reliability': '1',      # 1 = RELIABLE
+        'general.qos_durability': '1',       # 1 = TRANSIENT_LOCAL (work with RViz)
+        
+        # Depth settings - optimized for reducing blinking
         'depth.depth_mode': 'NEURAL_LIGHT',  # High quality depth mode
         'depth.min_depth': min_depth,
         'depth.max_depth': max_depth,
         'depth.depth_stabilization': '100',  # Maximum stability
-        'depth.point_cloud_freq': '15.0',
+        'depth.point_cloud_freq': '5.0',     # Reduced frequency to prevent overwhelming RViz
         
         # Positional tracking settings
         'pos_tracking.pos_tracking_enabled': 'true',
@@ -135,12 +142,13 @@ def generate_launch_description():
         launch_arguments=camera_params.items()
     )
     
-    # Define our occupancy grid node
+    # Define our occupancy grid node with optimized parameters
     occupancy_grid_node = Node(
         package='zed_occupancy_grid',
         executable='zed_occupancy_grid_node',
         name='zed_occupancy_grid_node',
         output='screen',
+        emulate_tty=True,
         parameters=[{
             'camera_frame': 'zed_left_camera_frame',  # Fixed frame name to match actual ZED camera frame
             'depth_topic': '/zed/zed_node/depth/depth_registered',  # Verified correct topic from ZED node
@@ -148,17 +156,29 @@ def generate_launch_description():
             'max_depth': max_depth,
             'resolution': resolution,  # Controls grid cell size - smaller values give more detail
             'grid_width': 15.0,  # Increased grid size for better coverage
-            'grid_height': 15.0  # Increased grid size for better coverage
+            'grid_height': 15.0,  # Increased grid size for better coverage
+            'use_sim_time': False
         }]
+        # Removing problematic QoS overrides - we'll handle QoS in the node itself
     )
     
-    # Define RViz2 node for visualization
+    # Define RViz2 node for visualization with optimized parameters
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
         name='rviz2',
         arguments=['-d', os.path.join(zed_occupancy_grid_dir, 'config', 'occupancy_grid.rviz')],
-        output='screen'
+        output='screen',
+        parameters=[{
+            # Increase buffer sizes for RViz consumers
+            'tf_buffer_cache_time_ms': 30000,  # 30 seconds buffer (increased from 10 seconds)
+            'tf_buffer_size': 200,  # Larger buffer size (doubled from 100)
+            'update_rate': 10.0,  # Further limit update rate to 10Hz (reduced from 15Hz)
+            'use_sim_time': False,
+            'qos_reliability': 1,  # 1 = RELIABLE 
+            'qos_durability': 1,   # 1 = TRANSIENT_LOCAL
+            'qos_depth': 20        # Larger queue depth
+        }]
     )
     
     # Define the TF setup node to broadcast necessary transforms
@@ -166,7 +186,10 @@ def generate_launch_description():
         package='zed_occupancy_grid',
         executable='zed_tf_setup',
         name='zed_tf_setup',
-        output='screen'
+        output='screen',
+        parameters=[{
+            'publish_frequency': 10.0  # Lower frequency for static transforms
+        }]
     )
     
     # Create the launch description and add actions
@@ -180,13 +203,13 @@ def generate_launch_description():
     ld.add_action(declare_min_depth_cmd)
     ld.add_action(declare_max_depth_cmd)
     
-    # Add the ZED camera launch to our launch description
-    ld.add_action(zed_camera_launch)
-    
-    # Add the TF setup node
+    # Add the TF setup node first to ensure transforms are published before other nodes start
     ld.add_action(tf_setup_node)
     
-    # Add our occupancy grid node
+    # Add the ZED camera launch description
+    ld.add_action(zed_camera_launch)
+    
+    # Add our occupancy grid node after TF is set up
     ld.add_action(occupancy_grid_node)
     
     # Add RViz2 node (optional, can be commented out if not needed)

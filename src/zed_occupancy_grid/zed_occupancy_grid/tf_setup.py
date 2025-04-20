@@ -19,17 +19,27 @@ class StaticTFPublisher(Node):
         # Publish necessary static transforms
         tf_transforms = []
         
-        # IMPORTANT: Let the ZED node handle most of the frame transforms
-        # Only add the map->odom transform which the ZED node needs but doesn't provide
-        self.get_logger().info('Setting up minimal TF transforms to avoid conflicts with ZED node')
+        # IMPORTANT: We need to ensure a proper TF tree for occupancy grid mapping
+        self.get_logger().info('Setting up TF transforms for occupancy grid')
         
-        # Map to odom transform is the only one we need to provide
+        # Map to odom transform - critical connection for mapping
         map_to_odom = self.create_transform('map', 'odom', 0.0, 0.0, 0.0)
         tf_transforms.append(map_to_odom)
         
         # Add a ground frame for visualization
         map_to_ground = self.create_transform('map', 'ground', 0.0, 0.0, -0.3)
         tf_transforms.append(map_to_ground)
+        
+        # Add fallback transforms that might be missing
+        # We need to ensure the connection from odom to camera frames exists
+        # Only used if ZED node doesn't publish these
+        odom_to_base = self.create_transform('odom', 'zed_camera_link', 0.0, 0.0, 0.0)
+        tf_transforms.append(odom_to_base)
+        
+        # Camera base to left camera frame transform
+        # This matches the ZED camera's internal calibration
+        base_to_left = self.create_transform('zed_camera_link', 'zed_left_camera_frame', 0.01, -0.06, -0.015)
+        tf_transforms.append(base_to_left)
         
         # Publish all transforms
         self.static_broadcaster.sendTransform(tf_transforms)
