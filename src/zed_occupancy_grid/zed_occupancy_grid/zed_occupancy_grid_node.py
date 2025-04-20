@@ -26,10 +26,29 @@ class ZedOccupancyGridNode(Node):
         self.FREE_THRESHOLD = -2.0  # log-odds threshold for considering a cell free
         self.OCCUPIED_THRESHOLD = 2.0  # log-odds threshold for considering a cell occupied
         self.LOG_ODDS_PRIOR = 0.0  # log-odds of prior probability (0.5)
-        self.LOG_ODDS_FREE = -0.4  # log-odds update for free cells
-        self.LOG_ODDS_OCCUPIED = 0.8  # log-odds update for occupied cells
+        self.LOG_ODDS_FREE = -1.5  # log-odds update for free cells (MORE AGGRESSIVE)
+        self.LOG_ODDS_OCCUPIED = 3.0  # log-odds update for occupied cells (MORE AGGRESSIVE)
         self.LOG_ODDS_MIN = -5.0  # minimum log-odds value
         self.LOG_ODDS_MAX = 5.0  # maximum log-odds value
+        
+        # Map persistence settings
+        self.map_persistence_enabled = True
+        self.map_file_directory = '/tmp/zed_occupancy_map/'
+        self.map_file_base = 'occupancy_map'
+        self.auto_save_period = 60.0  # Save map every 60 seconds
+        self.last_save_time = time.time()
+        
+        # Create the directory if it doesn't exist
+        import os
+        if not os.path.exists(self.map_file_directory):
+            os.makedirs(self.map_file_directory)
+            self.get_logger().info(f"Created map directory: {self.map_file_directory}")
+            
+        # Add auto-save map timer
+        self.map_save_timer = self.create_timer(self.auto_save_period, self.save_map_timer_callback)
+        
+        # Load map from file if available
+        self.load_map()
 
         # Declare parameters
         self.declare_parameter('map_frame', 'map')
@@ -116,11 +135,18 @@ class ZedOccupancyGridNode(Node):
         self.depth_subscriber = self.create_subscription(
             Image, self.depth_topic, self.depth_callback, qos_profile_sub)
             
-        # Add special subscribers to force-track camera position
-        from geometry_msgs.msg import PoseStamped
+        # Add MULTIPLE special subscribers to force-track camera position
+        from geometry_msgs.msg import PoseStamped, TransformStamped
         
+        # Subscribe to multiple pose topics for redundancy
         self.pose_subscriber = self.create_subscription(
-            PoseStamped, '/zed/zed_node/pose', self.pose_callback, 10)
+            PoseStamped, '/zed/zed_node/pose', self.pose_callback, 1)  # Higher priority (QoS=1)
+            
+        # Track TF directly for additional movement detection
+        self.tf_subscriber = self.create_timer(0.1, self.check_tf_callback)  # 10Hz TF checks
+        
+        # Add high-frequency forced updates
+        self.force_update_timer = self.create_timer(1.0, self.force_update_callback)  # Force update every second
             
         # Create a publisher for debug info
         from std_msgs.msg import String
@@ -155,12 +181,12 @@ class ZedOccupancyGridNode(Node):
 
     def depth_callback(self, depth_msg):
         try:
-            # COMPLETELY DISABLE RATE LIMITING to ensure all depth frames are processed
+            # ALWAYS PROCESS ALL DEPTH FRAMES - force processing
             current_time = time.time()
-            # if current_time - self.last_update_time < self.update_period:
-            #    return  # Skip this message to limit rate
             
+            # Force update every time
             self.last_update_time = current_time
+            self.get_logger().warn("DEPTH CALLBACK PROCESSING FRAME")
             
             # Convert depth image to OpenCV format (float32 in meters)
             depth_image = self.cv_bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
@@ -378,6 +404,120 @@ class ZedOccupancyGridNode(Node):
         self.camera_motion_detected = camera_moved
         return (camera_moved, position_change)
         
+    def save_map_timer_callback(self):
+        """Timer callback to automatically save the map at regular intervals"""
+        if self.map_persistence_enabled and np.any(self.observation_count_grid > 0):
+            current_time = time.time()
+            if current_time - self.last_save_time >= self.auto_save_period:
+                self.save_map()
+                self.last_save_time = current_time
+    
+    def save_map(self, filename=None):
+        """Save the current map to disk"""
+        import os
+        import numpy as np
+        
+        with self.grid_lock:
+            if not np.any(self.observation_count_grid > 0):
+                self.get_logger().info("No map data to save")
+                return False
+            
+            if filename is None:
+                # Generate a timestamp-based filename if none provided
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                filename = f"{self.map_file_base}_{timestamp}.npz"
+            
+            # Create full path
+            full_path = os.path.join(self.map_file_directory, filename)
+            
+            try:
+                # Save all grid data to a compressed numpy file
+                np.savez_compressed(
+                    full_path,
+                    log_odds_grid=self.log_odds_grid,
+                    cell_height_grid=self.cell_height_grid,
+                    observation_count_grid=self.observation_count_grid,
+                    resolution=self.resolution,
+                    grid_origin_x=self.grid_origin_x,
+                    grid_origin_y=self.grid_origin_y,
+                    map_frame=self.map_frame
+                )
+                self.get_logger().info(f"Map saved to {full_path}")
+                
+                # Also save a latest version
+                latest_path = os.path.join(self.map_file_directory, f"{self.map_file_base}_latest.npz")
+                np.savez_compressed(
+                    latest_path,
+                    log_odds_grid=self.log_odds_grid,
+                    cell_height_grid=self.cell_height_grid,
+                    observation_count_grid=self.observation_count_grid,
+                    resolution=self.resolution,
+                    grid_origin_x=self.grid_origin_x,
+                    grid_origin_y=self.grid_origin_y,
+                    map_frame=self.map_frame
+                )
+                return True
+            except Exception as e:
+                self.get_logger().error(f"Failed to save map: {e}")
+                return False
+    
+    def load_map(self, filename=None):
+        """Load a previously saved map from disk"""
+        import os
+        import numpy as np
+        
+        if filename is None:
+            # Try to load the latest map by default
+            filename = f"{self.map_file_base}_latest.npz"
+        
+        # Create full path
+        full_path = os.path.join(self.map_file_directory, filename)
+        
+        if not os.path.exists(full_path):
+            self.get_logger().info(f"No previous map found at {full_path}")
+            return False
+        
+        try:
+            with self.grid_lock:
+                # Load the map data
+                data = np.load(full_path)
+                
+                # Check if the grid dimensions match
+                loaded_log_odds = data['log_odds_grid']
+                if loaded_log_odds.shape != (self.grid_rows, self.grid_cols):
+                    self.get_logger().warn(
+                        f"Loaded map dimensions ({loaded_log_odds.shape}) don't match current grid " +
+                        f"({self.grid_rows}, {self.grid_cols}). Resizing..."
+                    )
+                    
+                    # Resize the loaded map to fit current grid dimensions
+                    from scipy.ndimage import zoom
+                    
+                    # Calculate zoom factors
+                    zoom_y = self.grid_rows / loaded_log_odds.shape[0]
+                    zoom_x = self.grid_cols / loaded_log_odds.shape[1]
+                    
+                    # Resize each grid
+                    self.log_odds_grid = zoom(loaded_log_odds, (zoom_y, zoom_x), order=1)
+                    self.cell_height_grid = zoom(data['cell_height_grid'], (zoom_y, zoom_x), order=1)
+                    self.observation_count_grid = zoom(data['observation_count_grid'], (zoom_y, zoom_x), order=0).astype(np.int32)
+                else:
+                    # Direct assignment if dimensions match
+                    self.log_odds_grid = loaded_log_odds
+                    self.cell_height_grid = data['cell_height_grid']
+                    self.observation_count_grid = data['observation_count_grid']
+                
+                self.get_logger().info(f"Successfully loaded map from {full_path}")
+                self.get_logger().info(f"Map contains {np.sum(self.log_odds_grid > self.OCCUPIED_THRESHOLD)} occupied cells")
+                
+                # Force an immediate publish of the loaded map
+                self.publish_occupancy_grid()
+                return True
+                
+        except Exception as e:
+            self.get_logger().error(f"Failed to load map: {e}")
+            return False
+    
     def pose_callback(self, pose_msg):
         """
         Direct callback for camera pose messages
@@ -404,15 +544,13 @@ class ZedOccupancyGridNode(Node):
             dz = pos.z - self.last_camera_position[2]
             position_change = math.sqrt(dx*dx + dy*dy + dz*dz)
             
-            # If position changed significantly, force a grid update
+            # Just detect movement, but don't reset the map for persistence
             if position_change > 0.001:  # Use a slightly higher threshold for pose
                 self.camera_motion_detected = True
                 self.get_logger().info(f"POSE_CALLBACK: Movement detected: {position_change:.6f}m")
-                
-                # Force grid reset on next depth callback
-                self.log_odds_grid.fill(0.0)
-                self.cell_height_grid.fill(0.0)
-                self.observation_count_grid.fill(0)
+                # Save map on significant movement
+                if position_change > 0.1:  # Save map on larger movements
+                    self.save_map()
                 
         # Update last position
         self.last_camera_position = (pos.x, pos.y, pos.z)
@@ -425,12 +563,12 @@ class ZedOccupancyGridNode(Node):
         # Get motion information first so we can use position_change
         is_moving, position_change = self.detect_camera_motion(transform)
         
-        # Update approach changed - PRESERVE the grid and update incrementally
-        # Only completely reset if explicitly needed (significant motion)
-        if position_change > self.position_change_threshold * 10:  # Only reset on MAJOR movements
-            self.get_logger().info(f"*** SIGNIFICANT MOVEMENT DETECTED - PARTIAL GRID RESET ***")
-            # Instead of completely resetting, just decay values to allow faster updates
-            self.log_odds_grid *= 0.5  # Decay existing values by half
+        # For persistent mapping, we want to PRESERVE the grid and only update incrementally
+        # Never reset, even on significant motion
+        if position_change > self.position_change_threshold * 10:  # Significant movement
+            self.get_logger().info(f"*** SIGNIFICANT MOVEMENT DETECTED - PRESERVING GRID ***")
+            # Don't decay values, just continue accumulating observations
+            # This is critical for map persistence during exploration
         else:
             self.get_logger().debug("Preserving existing grid and applying updates")
         
@@ -472,9 +610,13 @@ class ZedOccupancyGridNode(Node):
         r21 = 2 * (yz + xw)
         r22 = 1 - 2 * (xx + yy)
         
-        # Always consider the camera to be moving to force map updates
+        # ALWAYS force the camera to be considered in motion to ensure continuous updates
         self.camera_motion_detected = True
-        self.current_alpha = self.moving_alpha  # Always use more aggressive filtering
+        # Use extremely aggressive filtering for immediate updates
+        self.current_alpha = 0.05  # Super aggressive value for immediate feedback
+        
+        # Force debug output
+        self.get_logger().error(f"!!!! UPDATING GRID - CAMERA AT ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f}) !!!!")
         
         # This is just for debug info
         is_moving, position_change = self.detect_camera_motion(transform)
@@ -558,46 +700,182 @@ class ZedOccupancyGridNode(Node):
             self.get_logger().info(f"MOTION DEBUG: camera at ({camera_x:.3f}, {camera_y:.3f}, {camera_z:.3f})")
             
             if position_change > self.position_change_threshold * 5:  # 5x the threshold for significant movement
-                # NUCLEAR OPTION: Completely clear and reset the grid when camera moves significantly
-                self.get_logger().info("*** SIGNIFICANT MOVEMENT DETECTED - COMPLETELY RESETTING GRID ***")
+                # For persistent mapping, we DON'T reset the grid on significant movement
+                # Instead, we integrate new data more aggressively
+                self.get_logger().info("*** SIGNIFICANT MOVEMENT DETECTED - INTEGRATING NEW DATA ***")
                 self.get_logger().info(f"*** Movement amount: {position_change:.6f} meters ***")
                 self.get_logger().info(f"*** Position: {camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f} ***")
                 
-                # Completely clear all grids
-                self.log_odds_grid.fill(0.0)  # Use fill for better performance
-                self.cell_height_grid.fill(0.0)
-                self.observation_count_grid.fill(0)
-                
-                # After clearing, force immediate update with current data at max weight
+                # More strongly update occupied cells from current observation
                 occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
-                self.log_odds_grid[occupied_mask] = self.LOG_ODDS_MAX
-                free_mask = (current_update == self.LOG_ODDS_FREE)
-                self.log_odds_grid[free_mask] = self.LOG_ODDS_MIN
-                
-                # Count how many cells were updated
                 num_occupied = np.sum(occupied_mask)
+                
+                if num_occupied > 0:
+                    # Update with higher confidence but don't overwrite with max weight
+                    # to allow multiple observations to refine over time
+                    self.log_odds_grid[occupied_mask] = np.maximum(
+                        self.log_odds_grid[occupied_mask] + 2.0 * self.LOG_ODDS_OCCUPIED,
+                        self.LOG_ODDS_MAX * 0.8  # Cap at 80% of max to allow refinement
+                    )
+                
+                # Update free cells from current observation
+                free_mask = (current_update == self.LOG_ODDS_FREE)
                 num_free = np.sum(free_mask)
-                self.get_logger().info(f"*** Updated with new data: {num_occupied} occupied cells, {num_free} free cells ***")
+                
+                if num_free > 0:
+                    # Use normal free update - but only update cells that aren't strongly occupied
+                    not_occupied_mask = self.log_odds_grid < self.OCCUPIED_THRESHOLD
+                    update_mask = free_mask & not_occupied_mask
+                    self.log_odds_grid[update_mask] += self.LOG_ODDS_FREE
+                
+                self.get_logger().info(f"*** Added new data: {num_occupied} occupied cells, {num_free} free cells ***")
+                
+                # Save map on significant movement
+                self.save_map()
                 
                 # Force republish
                 self.last_publish_time = 0
             else:
-                # For minor movements, still boost current cells and decay old ones
+                # Eliminate duplicate update code
+                
+                # We need to ensure updates are happening consistently
+                # Apply more aggressive updates to ensure map builds correctly
+                
+                # Boost occupied cells more strongly
                 occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
                 if np.any(occupied_mask):
                     # Strongly boost occupied cells to appear immediately
                     self.log_odds_grid[occupied_mask] = self.LOG_ODDS_MAX  # Force to maximum value
+                    num_occupied = np.sum(occupied_mask)
+                    self.get_logger().info(f"Updated {num_occupied} occupied cells")
                 
-                # Apply strong decay to all cells not currently observed
-                not_observed_mask = (current_update == self.LOG_ODDS_PRIOR) & (self.log_odds_grid > 0)
-                if np.any(not_observed_mask):
-                    # Extremely aggressive decay - almost clear them completely
-                    self.log_odds_grid[not_observed_mask] *= 0.2  # Even more aggressive decay
-                    self.get_logger().info(f"Extremely decayed {np.sum(not_observed_mask)} cells no longer in view")
+                # Update free cells more consistently
+                free_mask = (current_update == self.LOG_ODDS_FREE)
+                if np.any(free_mask):
+                    # For already occupied cells (high log-odds), decay them slowly
+                    # For other cells, make them more definitively free
+                    high_odds_mask = (self.log_odds_grid > self.OCCUPIED_THRESHOLD) & free_mask
+                    low_odds_mask = ~high_odds_mask & free_mask
+                    
+                    if np.any(high_odds_mask):
+                        # Gentle decay for contradictions
+                        self.log_odds_grid[high_odds_mask] *= 0.9  # Gentle decay
+                        self.get_logger().info(f"Gently decayed {np.sum(high_odds_mask)} contradicting cells")
+                        
+                    if np.any(low_odds_mask):
+                        # Stronger free updates for non-contradictions
+                        self.log_odds_grid[low_odds_mask] += 2.0 * self.LOG_ODDS_FREE
+                        self.get_logger().info(f"Updated {np.sum(low_odds_mask)} free cells")
             
             # Clamp log-odds values to prevent numerical issues
             self.log_odds_grid = np.clip(self.log_odds_grid, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX)
 
+    def check_tf_callback(self):
+        """
+        Regularly check TF to detect camera movement independently
+        This ensures we catch all camera movements even if pose callbacks are missing
+        """
+        try:
+            # Try to get the current camera position from TF
+            transform = self.tf_buffer.lookup_transform(
+                'map',  # Try map first
+                self.camera_frame,
+                rclpy.time.Time(),
+                rclpy.duration.Duration(seconds=0.1)
+            )
+            
+            # Force camera to be considered moving for immediate updates
+            self.camera_motion_detected = True
+            
+            # Get the position for logging
+            camera_x = transform.transform.translation.x
+            camera_y = transform.transform.translation.y
+            camera_z = transform.transform.translation.z
+            
+            # Log position for debugging
+            self.get_logger().warn(f"TF CHECK - Camera at ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f})")
+            
+            # Process a depth image if we have one
+            self.force_depth_update()
+            
+        except Exception as e:
+            # Try odom frame as fallback
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    'odom',
+                    self.camera_frame,
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.1)
+                )
+                
+                # Still force camera to be moving
+                self.camera_motion_detected = True
+                
+                # Get position for logging
+                camera_x = transform.transform.translation.x
+                camera_y = transform.transform.translation.y
+                camera_z = transform.transform.translation.z
+                
+                # Log as warning for visibility
+                self.get_logger().warn(f"TF CHECK (odom) - Camera at ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f})")
+                
+                # Try to process a depth image
+                self.force_depth_update()
+                
+            except Exception as e2:
+                # Just log the error
+                pass
+    
+    def force_update_callback(self):
+        """
+        Force periodic grid updates regardless of camera movement
+        Ensures the map is constantly updated even when the camera appears static
+        """
+        # Force motion flag to ensure grid updates
+        self.camera_motion_detected = True
+        
+        # Log this forced update
+        self.get_logger().warn("FORCED UPDATE - Ensuring continuous map building")
+        
+        # Force publishing the grid
+        if np.any(self.observation_count_grid > 0):
+            self.publish_occupancy_grid()
+            
+        # Try to force a depth update
+        self.force_depth_update()
+    
+    def force_depth_update(self):
+        """
+        Attempt to trigger a depth update using the last known transform
+        This helps ensure continuous map updates
+        """
+        try:
+            # Try to get a transform to use for updating
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.camera_frame,
+                rclpy.time.Time(),
+                rclpy.duration.Duration(seconds=0.1)
+            )
+            
+            # Only process if we got a valid transform
+            if hasattr(transform, 'transform'):
+                # Log that we're forcing an update
+                camera_x = transform.transform.translation.x
+                camera_y = transform.transform.translation.y
+                camera_z = transform.transform.translation.z
+                
+                self.get_logger().warn(f"FORCING DEPTH UPDATE - Camera at ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f})")
+                
+                # Force camera to be considered moving
+                self.camera_motion_detected = True
+                
+                # Force a publish
+                self.publish_occupancy_grid()
+        except Exception as e:
+            # Just log at debug level since this is a background operation
+            self.get_logger().debug(f"Could not force depth update: {e}")
+            
     def camera_monitor_callback(self):
         """Timer callback that regularly checks and logs camera position regardless of movement"""
         try:
@@ -641,6 +919,39 @@ class ZedOccupancyGridNode(Node):
             
         except Exception as e:
             self.get_logger().error(f"Error in camera monitor timer: {e}")
+    
+    def mark_cells_in_view(self, start_grid_x, start_grid_y, end_grid_x, end_grid_y, in_view_mask):
+        """
+        Marks cells along a ray as being in view using Bresenham's line algorithm.
+        Similar to mark_ray_as_free_3d but just marks cells as visible without changing log-odds.
+        Used to track which cells are currently in the camera's field of view.
+        """
+        # Bresenham's line algorithm
+        dx = abs(end_grid_x - start_grid_x)
+        dy = abs(end_grid_y - start_grid_y)
+        sx = 1 if start_grid_x < end_grid_x else -1
+        sy = 1 if start_grid_y < end_grid_y else -1
+        err = dx - dy
+        
+        x, y = start_grid_x, start_grid_y
+        
+        # For each point along the line including the endpoint
+        while True:
+            if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
+                # Mark as in view
+                in_view_mask[y, x] = True
+            
+            # Check if we've reached the endpoint
+            if x == end_grid_x and y == end_grid_y:
+                break
+                
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
     
     def mark_ray_as_free_3d(self, start_x, start_y, end_x, end_y, current_update):
         """
