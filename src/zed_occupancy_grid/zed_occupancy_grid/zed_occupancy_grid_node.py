@@ -18,8 +18,8 @@ class ZedOccupancyGridNode(Node):
     def __init__(self):
         super().__init__('zed_occupancy_grid_node')
         
-        # Set ROS logging to be less verbose
-        self.get_logger().set_level(rclpy.logging.LoggingSeverity.INFO)
+        # Set ROS logging to DEBUG to get all messages
+        self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
         
         # Occupancy probabilities - using log-odds for numerical stability
         # P(occupied) = 1 - 1/(1 + exp(l))
@@ -39,7 +39,7 @@ class ZedOccupancyGridNode(Node):
         self.declare_parameter('grid_height', 10.0)  # meters
         self.declare_parameter('min_depth', 0.5)    # min depth in meters
         self.declare_parameter('max_depth', 20.0)   # max depth in meters
-        self.declare_parameter('depth_topic', '/zed2i/zed_node/depth/depth_registered')
+        self.declare_parameter('depth_topic', '/zed/zed_node/depth/depth_registered')
 
         # Get parameters
         self.map_frame = self.get_parameter('map_frame').value
@@ -72,13 +72,16 @@ class ZedOccupancyGridNode(Node):
         self.min_observations = 1            # Minimum observations before marking as occupied - reduced to 1
         self.max_ray_length = 5.0            # Maximum ray length for ray casting
         
-        # Parameters for map updates with camera motion - INCREASED SENSITIVITY
+        # Parameters for map updates with camera motion - EXTREME SENSITIVITY FOR DYNAMIC UPDATES
         self.last_camera_position = None     # Track camera position to detect movement
-        self.position_change_threshold = 0.01 # Very small threshold to detect any movement
-        self.rotation_change_threshold = 0.01 # Very small threshold for rotation detection
-        self.reset_cells_on_movement = False  # Whether to reset cells that become out of view
+        self.declare_parameter('position_change_threshold', 0.0001)  # Ultra sensitive - detect almost any change 
+        self.position_change_threshold = 0.0  # ZERO THRESHOLD - ANY MOVEMENT WILL BE DETECTED
+        self.declare_parameter('rotation_change_threshold', 0.0001)  # Ultra sensitive
+        self.rotation_change_threshold = 0.0  # ZERO THRESHOLD - ANY ROTATION WILL BE DETECTED
+        self.reset_cells_on_movement = True   # Enable resetting cells that become out of view
         self.camera_motion_detected = False   # Flag to indicate if camera has moved
         self.last_camera_quaternion = None    # Track camera rotation
+        self.get_logger().info("!!! EXTREMELY SENSITIVE MOTION DETECTION ENABLED !!!")
         
         # Camera movement adaptation settings - MORE RESPONSIVE
         self.static_alpha = 0.7              # Less temporal filtering even when static (0.7 instead of 0.9)
@@ -109,8 +112,19 @@ class ZedOccupancyGridNode(Node):
             OccupancyGrid, '/occupancy_grid', qos_profile_pub)
         
         # Make sure subscription QoS matches the publisher's QoS
+        # ADDITIONAL DEBUG TOPICS - Subscribe to pose directly to monitor camera movement
         self.depth_subscriber = self.create_subscription(
             Image, self.depth_topic, self.depth_callback, qos_profile_sub)
+            
+        # Add special subscribers to force-track camera position
+        from geometry_msgs.msg import PoseStamped
+        
+        self.pose_subscriber = self.create_subscription(
+            PoseStamped, '/zed/zed_node/pose', self.pose_callback, 10)
+            
+        # Create a publisher for debug info
+        from std_msgs.msg import String
+        self.debug_pub = self.create_publisher(String, '/zed_grid_debug', 10)
             
         # Add rate limiting with separate update/publish cycles - FASTER UPDATES
         self.last_publish_time = 0.0
@@ -126,6 +140,9 @@ class ZedOccupancyGridNode(Node):
         
         # Create a timer for regular map updates (even with no new data)
         self.map_timer = self.create_timer(0.2, self.publish_map_timer_callback)  # 5Hz timer
+        
+        # Create a special timer that always logs camera position regardless of movement
+        self.camera_monitor_timer = self.create_timer(0.5, self.camera_monitor_callback)  # 2Hz timer
 
         # TF buffer and listener
         self.tf_buffer = tf2_ros.Buffer(rclpy.duration.Duration(seconds=10.0))  # Larger buffer
@@ -138,10 +155,10 @@ class ZedOccupancyGridNode(Node):
 
     def depth_callback(self, depth_msg):
         try:
-            # Rate limiting to prevent overwhelming RViz
+            # COMPLETELY DISABLE RATE LIMITING to ensure all depth frames are processed
             current_time = time.time()
-            if current_time - self.last_update_time < self.update_period:
-                return  # Skip this message to limit rate
+            # if current_time - self.last_update_time < self.update_period:
+            #    return  # Skip this message to limit rate
             
             self.last_update_time = current_time
             
@@ -232,6 +249,7 @@ class ZedOccupancyGridNode(Node):
             # Create occupancy grid message
             grid_msg = OccupancyGrid()
             grid_msg.header.stamp = self.get_clock().now().to_msg()
+            # Return to using the map frame
             grid_msg.header.frame_id = override_frame if override_frame else self.map_frame
             
             # Set grid metadata
@@ -297,7 +315,7 @@ class ZedOccupancyGridNode(Node):
     def detect_camera_motion(self, transform):
         """
         Detect if the camera has moved significantly since the last update
-        Returns: True if camera moved, False if static
+        Returns: (is_moving, position_change) tuple - where position_change is the distance moved
         """
         camera_x = transform.transform.translation.x
         camera_y = transform.transform.translation.y
@@ -311,6 +329,7 @@ class ZedOccupancyGridNode(Node):
         # Calculate position change
         position_changed = False
         rotation_changed = False
+        position_change = 0.0  # Default if no last position
         
         if self.last_camera_position is not None:
             dx = camera_x - self.last_camera_position[0]
@@ -357,13 +376,64 @@ class ZedOccupancyGridNode(Node):
                 self.current_alpha = self.static_alpha
         
         self.camera_motion_detected = camera_moved
-        return camera_moved
+        return (camera_moved, position_change)
+        
+    def pose_callback(self, pose_msg):
+        """
+        Direct callback for camera pose messages
+        This ensures we detect camera movement even when transform detection fails
+        """
+        from std_msgs.msg import String
+        
+        # Extract position from the pose message
+        pos = pose_msg.pose.position
+        
+        # Log the position to both ROS log and a debug topic
+        position_str = f"POSE_MONITOR: Camera at ({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f})"
+        self.get_logger().info(position_str)
+        
+        # Publish to debug topic for external monitoring
+        debug_msg = String()
+        debug_msg.data = position_str
+        self.debug_pub.publish(debug_msg)
+        
+        # Calculate position change if we have a previous position
+        if self.last_camera_position is not None:
+            dx = pos.x - self.last_camera_position[0]
+            dy = pos.y - self.last_camera_position[1]
+            dz = pos.z - self.last_camera_position[2]
+            position_change = math.sqrt(dx*dx + dy*dy + dz*dz)
+            
+            # If position changed significantly, force a grid update
+            if position_change > 0.001:  # Use a slightly higher threshold for pose
+                self.camera_motion_detected = True
+                self.get_logger().info(f"POSE_CALLBACK: Movement detected: {position_change:.6f}m")
+                
+                # Force grid reset on next depth callback
+                self.log_odds_grid.fill(0.0)
+                self.cell_height_grid.fill(0.0)
+                self.observation_count_grid.fill(0)
+                
+        # Update last position
+        self.last_camera_position = (pos.x, pos.y, pos.z)
         
     def update_grid_from_depth(self, depth_image, transform):
         """
         Update the log-odds grid using the depth image and camera transform.
         Uses probabilistic updates for better map quality.
         """
+        # Get motion information first so we can use position_change
+        is_moving, position_change = self.detect_camera_motion(transform)
+        
+        # Update approach changed - PRESERVE the grid and update incrementally
+        # Only completely reset if explicitly needed (significant motion)
+        if position_change > self.position_change_threshold * 10:  # Only reset on MAJOR movements
+            self.get_logger().info(f"*** SIGNIFICANT MOVEMENT DETECTED - PARTIAL GRID RESET ***")
+            # Instead of completely resetting, just decay values to allow faster updates
+            self.log_odds_grid *= 0.5  # Decay existing values by half
+        else:
+            self.get_logger().debug("Preserving existing grid and applying updates")
+        
         height, width = depth_image.shape
         
         # Extract camera position
@@ -402,8 +472,15 @@ class ZedOccupancyGridNode(Node):
         r21 = 2 * (yz + xw)
         r22 = 1 - 2 * (xx + yy)
         
-        # Detect if camera has moved
-        is_moving = self.detect_camera_motion(transform)
+        # Always consider the camera to be moving to force map updates
+        self.camera_motion_detected = True
+        self.current_alpha = self.moving_alpha  # Always use more aggressive filtering
+        
+        # This is just for debug info
+        is_moving, position_change = self.detect_camera_motion(transform)
+        
+        # Debug - explicitly log current camera position every time we process data
+        self.get_logger().info(f"CAMERA MONITOR - Current position: ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f})")
         
         # Choose sampling density - always use fine sampling for better detail
         stride_y = 6  # Fine sampling for better details
@@ -474,20 +551,97 @@ class ZedOccupancyGridNode(Node):
                 mask = (current_update != self.LOG_ODDS_PRIOR)  # Only update cells we observed
                 self.log_odds_grid[mask] = self.current_alpha * self.log_odds_grid[mask] + (1-self.current_alpha) * current_update[mask]
                 
-                # When camera is moving, give extra weight to new observations
-                if is_moving:
-                    # Increase the weight of occupied cells in the current view
-                    occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
-                    if np.any(occupied_mask):
-                        # Boost occupied cells to appear faster
-                        self.log_odds_grid[occupied_mask] += 0.3
+            # When camera is moving, give extra weight to new observations and reduce weight of old observations
+            # We're always considering the camera to be moving now, so this code will always run
+            # Debug logs to track exact motion values
+            self.get_logger().info(f"MOTION DEBUG: position_change={position_change:.6f}, threshold={self.position_change_threshold}")
+            self.get_logger().info(f"MOTION DEBUG: camera at ({camera_x:.3f}, {camera_y:.3f}, {camera_z:.3f})")
+            
+            if position_change > self.position_change_threshold * 5:  # 5x the threshold for significant movement
+                # NUCLEAR OPTION: Completely clear and reset the grid when camera moves significantly
+                self.get_logger().info("*** SIGNIFICANT MOVEMENT DETECTED - COMPLETELY RESETTING GRID ***")
+                self.get_logger().info(f"*** Movement amount: {position_change:.6f} meters ***")
+                self.get_logger().info(f"*** Position: {camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f} ***")
+                
+                # Completely clear all grids
+                self.log_odds_grid.fill(0.0)  # Use fill for better performance
+                self.cell_height_grid.fill(0.0)
+                self.observation_count_grid.fill(0)
+                
+                # After clearing, force immediate update with current data at max weight
+                occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
+                self.log_odds_grid[occupied_mask] = self.LOG_ODDS_MAX
+                free_mask = (current_update == self.LOG_ODDS_FREE)
+                self.log_odds_grid[free_mask] = self.LOG_ODDS_MIN
+                
+                # Count how many cells were updated
+                num_occupied = np.sum(occupied_mask)
+                num_free = np.sum(free_mask)
+                self.get_logger().info(f"*** Updated with new data: {num_occupied} occupied cells, {num_free} free cells ***")
+                
+                # Force republish
+                self.last_publish_time = 0
             else:
-                # Faster but less stable updates - direct addition of log-odds
-                self.log_odds_grid += current_update * (current_update != self.LOG_ODDS_PRIOR)
+                # For minor movements, still boost current cells and decay old ones
+                occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
+                if np.any(occupied_mask):
+                    # Strongly boost occupied cells to appear immediately
+                    self.log_odds_grid[occupied_mask] = self.LOG_ODDS_MAX  # Force to maximum value
+                
+                # Apply strong decay to all cells not currently observed
+                not_observed_mask = (current_update == self.LOG_ODDS_PRIOR) & (self.log_odds_grid > 0)
+                if np.any(not_observed_mask):
+                    # Extremely aggressive decay - almost clear them completely
+                    self.log_odds_grid[not_observed_mask] *= 0.2  # Even more aggressive decay
+                    self.get_logger().info(f"Extremely decayed {np.sum(not_observed_mask)} cells no longer in view")
             
             # Clamp log-odds values to prevent numerical issues
             self.log_odds_grid = np.clip(self.log_odds_grid, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX)
 
+    def camera_monitor_callback(self):
+        """Timer callback that regularly checks and logs camera position regardless of movement"""
+        try:
+            # Try to get transform from camera to map or odom
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.map_frame,
+                    self.camera_frame,
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.1)  # Short timeout
+                )
+                # Use map frame
+                frame = self.map_frame
+            except Exception:
+                # Fall back to odom if map isn't available
+                transform = self.tf_buffer.lookup_transform(
+                    'odom',
+                    self.camera_frame,
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.1)
+                )
+                frame = 'odom'
+            
+            # Extract camera position
+            pos = transform.transform.translation
+            
+            # Always log camera position, even when not moving
+            from std_msgs.msg import String
+            position_str = f"TIMER_MONITOR: Camera at ({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f}) in {frame} frame"
+            self.get_logger().info(position_str)
+            
+            # Publish to debug topic for external monitoring
+            debug_msg = String()
+            debug_msg.data = position_str
+            self.debug_pub.publish(debug_msg)
+            
+            # Don't reset grid from the timer - just log and monitor
+            # Force a publish only if we have data
+            if np.any(self.observation_count_grid > 0):
+                self.publish_occupancy_grid(override_frame=frame)
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in camera monitor timer: {e}")
+    
     def mark_ray_as_free_3d(self, start_x, start_y, end_x, end_y, current_update):
         """
         Marks cells along a ray from start to end as free using 3D Bresenham's algorithm.

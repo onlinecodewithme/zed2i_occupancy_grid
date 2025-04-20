@@ -142,7 +142,7 @@ def generate_launch_description():
         launch_arguments=camera_params.items()
     )
     
-    # Define our occupancy grid node with optimized parameters
+    # Define our occupancy grid node with optimized parameters for dynamic updates
     occupancy_grid_node = Node(
         package='zed_occupancy_grid',
         executable='zed_occupancy_grid_node',
@@ -151,12 +151,19 @@ def generate_launch_description():
         emulate_tty=True,
         parameters=[{
             'camera_frame': 'zed_left_camera_frame',  # Fixed frame name to match actual ZED camera frame
-            'depth_topic': '/zed/zed_node/depth/depth_registered',  # Verified correct topic from ZED node
+            'depth_topic': '/zed/zed_node/depth/depth_registered',  # Match the actual camera model and namespace
+            'map_frame': 'map',  # Set the correct map frame to align with ZED's SLAM
             'min_depth': min_depth,
             'max_depth': max_depth,
             'resolution': resolution,  # Controls grid cell size - smaller values give more detail
             'grid_width': 15.0,  # Increased grid size for better coverage
             'grid_height': 15.0,  # Increased grid size for better coverage
+            # More responsive movement detection thresholds
+            'position_change_threshold': 0.005,  # Smaller threshold to detect minor movements
+            'rotation_change_threshold': 0.005,  # Smaller threshold for rotation detection
+            'moving_alpha': 0.2,  # Less temporal filtering when moving (more responsive)
+            'static_alpha': 0.6,  # Less temporal filtering even when static
+            'min_observations': 1,  # Allow quicker updates
             'use_sim_time': False
         }]
         # Removing problematic QoS overrides - we'll handle QoS in the node itself

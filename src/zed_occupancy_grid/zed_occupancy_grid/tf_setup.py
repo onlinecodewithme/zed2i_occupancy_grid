@@ -22,9 +22,9 @@ class StaticTFPublisher(Node):
         # IMPORTANT: We need to ensure a proper TF tree for occupancy grid mapping
         self.get_logger().info('Setting up TF transforms for occupancy grid')
         
-        # Map to odom transform - critical connection for mapping
-        map_to_odom = self.create_transform('map', 'odom', 0.0, 0.0, 0.0)
-        tf_transforms.append(map_to_odom)
+        # Map to odom transform - DISABLING this as it conflicts with ZED's built-in SLAM
+        # map_to_odom = self.create_transform('map', 'odom', 0.0, 0.0, 0.0)
+        # tf_transforms.append(map_to_odom)
         
         # Add a ground frame for visualization
         map_to_ground = self.create_transform('map', 'ground', 0.0, 0.0, -0.3)
