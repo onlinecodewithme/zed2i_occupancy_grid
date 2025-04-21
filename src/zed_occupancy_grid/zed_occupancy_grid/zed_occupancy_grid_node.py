@@ -138,9 +138,20 @@ class ZedOccupancyGridNode(Node):
         # Add MULTIPLE special subscribers to force-track camera position
         from geometry_msgs.msg import PoseStamped, TransformStamped
         
-        # Subscribe to multiple pose topics for redundancy
+        # Subscribe to ALL possible pose topics for maximum redundancy
+        # Try different topic names to ensure we catch camera movement
         self.pose_subscriber = self.create_subscription(
             PoseStamped, '/zed/zed_node/pose', self.pose_callback, 1)  # Higher priority (QoS=1)
+        
+        # Add redundant pose subscriptions with alternate topic names
+        self.pose_subscriber2 = self.create_subscription(
+            PoseStamped, '/zed/pose', self.pose_callback, 1)  # Alternative topic name
+            
+        self.pose_subscriber3 = self.create_subscription(
+            PoseStamped, '/zed2i/zed_node/pose', self.pose_callback, 1)  # Alternative camera name
+            
+        # Add debug logging for each subscription
+        self.get_logger().info("SETUP COMPLETE: Subscribed to multiple pose topics for redundant movement detection")
             
         # Track TF directly for additional movement detection
         self.tf_subscriber = self.create_timer(0.1, self.check_tf_callback)  # 10Hz TF checks
@@ -167,8 +178,8 @@ class ZedOccupancyGridNode(Node):
         # Maximum speed settings
         self.spatial_filtering = False  # DISABLED spatial filtering for maximum speed 
         
-        # Create a timer for regular map updates (even with no new data)
-        self.map_timer = self.create_timer(0.1, self.publish_map_timer_callback)  # MODIFIED: 10Hz timer for more frequent updates
+        # Create a timer for ULTRA-HIGH FREQUENCY map updates (even with no new data)
+        self.map_timer = self.create_timer(0.02, self.publish_map_timer_callback)  # MODIFIED: 50Hz timer for real-time updates
         
         # Create a special timer that always logs camera position regardless of movement
         self.camera_monitor_timer = self.create_timer(0.2, self.camera_monitor_callback)  # MODIFIED: 5Hz timer for more frequent checks
@@ -888,24 +899,97 @@ class ZedOccupancyGridNode(Node):
             self.observation_count_grid[y1, x1] += 1
     
     def check_tf_callback(self):
-        """Check transforms periodically to detect camera movement"""
+        """
+        Check transforms periodically to detect camera movement
+        MODIFIED: Far more aggressive detection, forced processing
+        """
         try:
-            transform = self.tf_buffer.lookup_transform(
-                self.map_frame,
-                self.camera_frame,
-                rclpy.time.Time(),
-                rclpy.duration.Duration(seconds=0.1)
-            )
+            # Try ALL possible transform lookups for maximum robustness
             
-            # Check for camera motion
-            is_moving, position_change = self.detect_camera_motion(transform)
-            
-            # Log the camera position
-            camera_pos = transform.transform.translation
-            self.get_logger().debug(f"TF Monitor: Camera at ({camera_pos.x:.2f}, {camera_pos.y:.2f}, {camera_pos.z:.2f})")
+            # Attempt 1: Direct lookup (map to camera)
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.map_frame,
+                    self.camera_frame,
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.1)
+                )
+                
+                # Log PROMINENTLY for debugging
+                camera_pos = transform.transform.translation
+                self.get_logger().warn(f"TF DIRECT: Map->Camera position: ({camera_pos.x:.4f}, {camera_pos.y:.4f}, {camera_pos.z:.4f})")
+                
+                # MANUAL/FORCED MOVEMENT DETECTION
+                # Even if no movement is reported, treat minor differences as movement
+                if self.last_camera_position is not None:
+                    dx = camera_pos.x - self.last_camera_position[0]
+                    dy = camera_pos.y - self.last_camera_position[1]
+                    dz = camera_pos.z - self.last_camera_position[2]
+                    dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+                    
+                    # ULTRA SENSITIVE detection - treat ANY non-zero change as movement
+                    if abs(dx) > 0.00001 or abs(dy) > 0.00001 or abs(dz) > 0.00001:
+                        self.camera_motion_detected = True
+                        self.get_logger().error(f"CRITICAL: DETECTED MINISCULE MOVEMENT: {dist:.9f}m ({dx:.9f}, {dy:.9f}, {dz:.9f})")
+                        
+                        # Force grid update immediately if we have depth data
+                        if hasattr(self, 'latest_depth_image') and self.latest_depth_image is not None:
+                            self.get_logger().error("TRIGGERING FORCED UPDATE FROM TF CALLBACK")
+                            self.update_grid_from_depth(self.latest_depth_image, transform)
+                            self.publish_occupancy_grid()
+                
+                self.last_camera_position = (camera_pos.x, camera_pos.y, camera_pos.z)
+                return  # Success, no need to try other methods
+            except Exception as e1:
+                self.get_logger().info(f"Direct transform lookup attempt failed: {str(e1)}")
+                # Fall through to next attempt
+                
+            # Attempt 2: Via odom frame
+            try:
+                # Get odom->camera transform
+                transform = self.tf_buffer.lookup_transform(
+                    'odom',
+                    self.camera_frame,
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.05)
+                )
+                
+                # Log position for debugging
+                camera_pos = transform.transform.translation
+                self.get_logger().warn(f"TF ODOM: Odom->Camera position: ({camera_pos.x:.4f}, {camera_pos.y:.4f}, {camera_pos.z:.4f})")
+                
+                # Always treat as movement when using odom frame
+                self.camera_motion_detected = True
+                
+                # Treat ANY detection as significant
+                if self.last_camera_position is None:
+                    self.last_camera_position = (camera_pos.x, camera_pos.y, camera_pos.z)
+                else:
+                    # Calculate "delta" from last position
+                    dx = camera_pos.x - self.last_camera_position[0] 
+                    dy = camera_pos.y - self.last_camera_position[1]
+                    dz = camera_pos.z - self.last_camera_position[2]
+                    dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+                    
+                    # Report any change
+                    if dist > 0.00001:
+                        self.get_logger().error(f"CRITICAL: ODOM MOVEMENT: {dist:.9f}m ({dx:.9f}, {dy:.9f}, {dz:.9f})")
+                    
+                    # Update last position 
+                    self.last_camera_position = (camera_pos.x, camera_pos.y, camera_pos.z)
+                
+                # Always force a grid update with odom frame
+                if hasattr(self, 'latest_depth_image') and self.latest_depth_image is not None:
+                    self.get_logger().warn("TRIGGERING FORCED UPDATE FROM ODOM TF LOOKUP")
+                    self.update_grid_from_depth(self.latest_depth_image, transform)
+                    self.publish_occupancy_grid(override_frame='odom')
+                
+                return  # Success with odom frame
+            except Exception as e2:
+                self.get_logger().info(f"Odom transform lookup attempt failed: {str(e2)}")
             
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-            self.get_logger().debug(f'TF Monitor: Error getting transform: {str(e)}')
+            self.get_logger().warn(f'TF Monitor: Error getting any transform: {str(e)}')
     
     def force_update_callback(self):
         """Force grid updates periodically even without new depth data"""
