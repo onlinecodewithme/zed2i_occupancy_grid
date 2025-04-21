@@ -13,6 +13,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDur
 import time
 import threading
 import math
+from std_msgs.msg import Bool, String
 
 # ANSI color codes for terminal output
 GREEN = '\033[92m'
@@ -277,6 +278,28 @@ class ZedOccupancyGridNode(Node):
         
         # Maximum speed settings
         self.spatial_filtering = False  # DISABLED spatial filtering for maximum speed 
+        
+        # Loop closure integration
+        self.loop_closure_detected = False
+        self.loop_closure_sub = self.create_subscription(
+            Bool, 
+            '/loop_closure/detected', 
+            self.loop_closure_callback, 
+            10
+        )
+        self.loop_closure_info_sub = self.create_subscription(
+            String,
+            '/loop_closure/info',
+            self.loop_closure_info_callback,
+            10
+        )
+        # Subscribe to the corrected grid published by the loop closure node
+        self.corrected_grid_sub = self.create_subscription(
+            OccupancyGrid,
+            '/occupancy_grid_corrected',
+            self.corrected_grid_callback,
+            qos_profile_pub  # Use same QoS as for publishing
+        )
         
         # Create a timer for ULTRA-HIGH FREQUENCY map updates (even with no new data)
         self.map_timer = self.create_timer(0.02, self.publish_map_timer_callback)  # MODIFIED: 50Hz timer for real-time updates
@@ -1380,6 +1403,70 @@ class ZedOccupancyGridNode(Node):
             debug_msg = String()
             debug_msg.data = position_str
             self.debug_pub.publish(debug_msg)
+    
+    def loop_closure_callback(self, msg):
+        """Handle loop closure detection notification"""
+        if msg.data:
+            self.get_logger().info(f"{GREEN}{BOLD}Loop closure detected by loop closure node!{END}")
+            self.loop_closure_detected = True
+            
+            # Save the map after loop closure for persistence
+            self.save_map("map_after_loop_closure.npz")
+    
+    def loop_closure_info_callback(self, msg):
+        """Handle loop closure information messages"""
+        self.get_logger().info(f"{CYAN}Loop closure info: {msg.data}{END}")
+    
+    def corrected_grid_callback(self, grid_msg):
+        """Handle the corrected occupancy grid from loop closure node"""
+        if not self.loop_closure_detected:
+            return  # Only process if a loop closure was detected
+        
+        self.get_logger().info(f"{GREEN}Received corrected grid from loop closure node{END}")
+        
+        with self.grid_lock:
+            try:
+                # Extract grid data
+                grid_data = np.array(grid_msg.data).reshape(
+                    grid_msg.info.height, grid_msg.info.width
+                )
+                
+                # Convert occupancy probabilities [0,100] to log-odds
+                log_odds_grid = np.zeros_like(grid_data, dtype=np.float32)
+                
+                # Convert only known cells
+                known_mask = grid_data != -1
+                
+                # Scale from [0,100] to [0,1]
+                probs = grid_data[known_mask].astype(np.float32) / 100.0
+                
+                # Avoid log(0) and log(1) by clipping
+                probs = np.clip(probs, 0.01, 0.99)
+                
+                # Convert to log-odds: log(p/(1-p))
+                log_odds_grid[known_mask] = np.log(probs / (1.0 - probs))
+                
+                # Update our grid with the corrected version
+                if log_odds_grid.shape == self.log_odds_grid.shape:
+                    self.log_odds_grid = log_odds_grid
+                    
+                    # Also update observation counts for consistency
+                    self.observation_count_grid[known_mask] = np.maximum(
+                        self.observation_count_grid[known_mask], 
+                        self.min_observations
+                    )
+                    
+                    self.get_logger().info(f"{GREEN}Successfully applied loop closure correction to map{END}")
+                    
+                    # Republish the corrected grid under our original topic
+                    self.publish_occupancy_grid()
+                    
+                    # Reset loop closure flag after applying correction
+                    self.loop_closure_detected = False
+                else:
+                    self.get_logger().error(f"Grid shape mismatch: {log_odds_grid.shape} vs {self.log_odds_grid.shape}")
+            except Exception as e:
+                self.get_logger().error(f"Error applying corrected grid: {str(e)}")
 
 
 def main(args=None):

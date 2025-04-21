@@ -25,7 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'zed_occupancy_grid_node = zed_occupancy_grid.zed_occupancy_grid_node:main',
-            'zed_tf_setup = zed_occupancy_grid.tf_setup:main'
+            'zed_tf_setup = zed_occupancy_grid.tf_setup:main',
+            'zed_loop_closure = zed_occupancy_grid.loop_closure:main'
         ],
     },
 )

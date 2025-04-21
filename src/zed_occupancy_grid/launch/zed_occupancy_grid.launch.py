@@ -203,6 +203,22 @@ def generate_launch_description():
         }]
     )
     
+    # Define the Loop Closure node for map correction
+    loop_closure_node = Node(
+        package='zed_occupancy_grid',
+        executable='zed_loop_closure',
+        name='zed_loop_closure_node',
+        output='screen',
+        emulate_tty=True,
+        parameters=[{
+            'camera_frame': 'zed_left_camera_frame',
+            'map_frame': 'map',
+            'grid_topic': '/occupancy_grid',
+            'pose_topic': '/zed/zed_node/pose',
+            'depth_topic': '/zed/zed_node/depth/depth_registered'
+        }]
+    )
+    
     # Create the launch description and add actions
     ld = LaunchDescription()
     
@@ -222,6 +238,9 @@ def generate_launch_description():
     
     # Add our occupancy grid node after camera and TF are set up
     ld.add_action(occupancy_grid_node)
+    
+    # Add loop closure node for map correction
+    ld.add_action(loop_closure_node)
     
     # Add RViz2 node (optional, can be commented out if not needed)
     ld.add_action(rviz_node)
