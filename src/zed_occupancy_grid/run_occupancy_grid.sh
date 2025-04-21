@@ -19,6 +19,12 @@ source install/setup.bash
 # Set display for GUI applications
 export DISPLAY=:1
 
+# Set CUDA environment variables for GPU acceleration
+export NUMBA_CUDA_DRIVER=/usr/lib/x86_64-linux-gnu/libcuda.so
+export CUDA_VISIBLE_DEVICES=0
+export NUMBA_CUDA_ENABLE_CUDASIM=0
+export NUMBA_CUDA_ARRAY_INTERFACE_SYNC=1
+
 # Set ROS logging level for better debug information
 export RCUTILS_CONSOLE_OUTPUT_FORMAT="[{severity}] [{name}]: {message}"
 export RCUTILS_COLORIZED_OUTPUT=1

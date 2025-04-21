@@ -16,13 +16,15 @@ import math
 
 # CUDA and GPU acceleration imports
 try:
-    import cupy as cp  # GPU-accelerated NumPy alternative
-    import numba
-    from numba import cuda, jit  # For creating CUDA kernels
-    CUDA_AVAILABLE = True
-except ImportError:
+    from . import cuda_acceleration
+    CUDA_AVAILABLE = cuda_acceleration.CUDA_AVAILABLE
+    if CUDA_AVAILABLE:
+        print("✅ CUDA acceleration module imported successfully!")
+    else:
+        print("⚠️ CUDA acceleration module imported but CUDA is not available!")
+except ImportError as e:
     CUDA_AVAILABLE = False
-    print("WARNING: CUDA libraries not found. Falling back to CPU processing.")
+    print(f"WARNING: CUDA acceleration module not found - {str(e)}. Falling back to CPU processing.")
 
 class ZedOccupancyGridNode(Node):
     def __init__(self):
@@ -37,153 +39,37 @@ class ZedOccupancyGridNode(Node):
             self.get_logger().warn("CUDA is not available - using CPU fallback")
     
     def initialize_cuda_functions(self):
-        """Initialize CUDA kernels for GPU-accelerated processing"""
+        """Initialize CUDA accelerator for GPU-accelerated processing"""
         global CUDA_AVAILABLE
         
         if not CUDA_AVAILABLE:
             return
         
         try:
-            # Create JIT-compiled CUDA kernels for the most computationally intensive parts
+            # Initialize our optimized CUDA accelerator
+            from . import cuda_acceleration
             
-            # 1. Kernel for transforming depth points to world coordinates
-            self.transform_points_cuda = cuda.jit("""
-            def transform_points_kernel(depth_image, rotation_matrix, camera_pos, 
-                                       width, height, step, tan_fov_h, tan_fov_v,
-                                       min_depth, max_depth, result_points):
-                # Get thread indices
-                tx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
-                ty = cuda.threadIdx.y + cuda.blockIdx.y * cuda.blockDim.y
+            # Create the accelerator instance with our logger
+            self.cuda_accelerator = cuda_acceleration.CudaAccelerator(self.get_logger())
+            
+            # Check if CUDA is really available
+            if self.cuda_accelerator.is_available():
+                self.get_logger().info("CUDA GPU acceleration initialized successfully with optimal settings")
                 
-                # Check if within image bounds and step size
-                if tx < width and ty < height and tx % step == 0 and ty % step == 0:
-                    # Get depth value
-                    depth = depth_image[ty, tx]
-                    
-                    # Skip invalid depth values
-                    if not math.isfinite(depth) or depth < min_depth or depth > max_depth:
-                        result_points[ty, tx, 0] = -1000.0  # Mark as invalid
-                        return
-                        
-                    # Calculate normalized image coordinates
-                    normalized_u = (2.0 * tx / width - 1.0)
-                    normalized_v = (2.0 * ty / height - 1.0)
-                    
-                    # Calculate 3D vector from camera using field of view
-                    ray_x = normalized_u * tan_fov_h * depth
-                    ray_y = normalized_v * tan_fov_v * depth
-                    ray_z = depth
-                    
-                    # Transform ray from camera to world coordinates
-                    world_x = (rotation_matrix[0, 0] * ray_x +
-                              rotation_matrix[0, 1] * ray_y +
-                              rotation_matrix[0, 2] * ray_z) + camera_pos[0]
-                    
-                    world_y = (rotation_matrix[1, 0] * ray_x +
-                              rotation_matrix[1, 1] * ray_y +
-                              rotation_matrix[1, 2] * ray_z) + camera_pos[1]
-                    
-                    world_z = (rotation_matrix[2, 0] * ray_x +
-                              rotation_matrix[2, 1] * ray_y +
-                              rotation_matrix[2, 2] * ray_z) + camera_pos[2]
-                    
-                    # Store result in output array
-                    result_points[ty, tx, 0] = world_x
-                    result_points[ty, tx, 1] = world_y
-                    result_points[ty, tx, 2] = world_z
-            """)
-            
-            # 2. Kernel for updating grid cells (log-odds) from ray endpoints
-            self.update_endpoints_cuda = cuda.jit("""
-            def update_endpoints_kernel(world_points, grid_origin_x, grid_origin_y, 
-                                       resolution, grid_cols, grid_rows,
-                                       camera_x, camera_y, max_ray_length,
-                                       log_odds_grid, cell_height_grid, observation_count_grid,
-                                       log_odds_occupied, log_odds_min, log_odds_max,
-                                       current_alpha, temporal_filtering):
-                # Get thread indices
-                tx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
-                ty = cuda.threadIdx.y + cuda.blockIdx.y * cuda.blockDim.y
+                # Add CUDA-specific parameters
+                self.declare_parameter('use_cuda', True)
+                self.declare_parameter('cuda_step', 4)  # Step size for CUDA processing (higher = faster but less detail)
+                self.declare_parameter('cuda_ray_step', 2)  # Step size for ray tracing on GPU
                 
-                # Check if within points array bounds
-                if tx < world_points.shape[1] and ty < world_points.shape[0]:
-                    # Get world point
-                    world_x = world_points[ty, tx, 0]
-                    world_y = world_points[ty, tx, 1]
-                    world_z = world_points[ty, tx, 2]
-                    
-                    # Skip invalid points (marked with -1000)
-                    if world_x == -1000.0:
-                        return
-                        
-                    # Skip points that are too far from camera
-                    dist_sq = (world_x - camera_x)**2 + (world_y - camera_y)**2
-                    if dist_sq > max_ray_length**2:
-                        return
-                    
-                    # Convert world coordinates to grid cell coordinates
-                    grid_x = int((world_x - grid_origin_x) / resolution)
-                    grid_y = int((world_y - grid_origin_y) / resolution)
-                    
-                    # Skip if out of grid bounds
-                    if grid_x < 0 or grid_x >= grid_cols or grid_y < 0 or grid_y >= grid_rows:
-                        return
-                    
-                    # Update log-odds for occupied cell (endpoint)
-                    if temporal_filtering:
-                        log_odds_grid[grid_y, grid_x] = (1 - current_alpha) * log_odds_grid[grid_y, grid_x] + current_alpha * log_odds_occupied
-                    else:
-                        log_odds_grid[grid_y, grid_x] += log_odds_occupied
-                    
-                    # Ensure log-odds value stays within bounds
-                    log_odds_grid[grid_y, grid_x] = max(log_odds_min, min(log_odds_max, log_odds_grid[grid_y, grid_x]))
-                    
-                    # Update height value
-                    if cell_height_grid[grid_y, grid_x] == 0:
-                        cell_height_grid[grid_y, grid_x] = world_z
-                    else:
-                        # Average with previous height
-                        cell_height_grid[grid_y, grid_x] = 0.7 * cell_height_grid[grid_y, grid_x] + 0.3 * world_z
-                    
-                    # Increment observation count - use atomic add to prevent race conditions
-                    cuda.atomic.add(observation_count_grid, (grid_y, grid_x), 1)
-            """)
-            
-            # 3. Kernel for converting log-odds to occupancy probabilities
-            self.log_odds_to_occupancy_cuda = cuda.jit("""
-            def log_odds_to_occupancy_kernel(log_odds_grid, observation_count_grid, min_observations,
-                                            occupied_threshold, free_threshold, grid_data):
-                # Get thread indices
-                tx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
-                ty = cuda.threadIdx.y + cuda.blockIdx.y * cuda.blockDim.y
+                # Get parameters
+                self.use_cuda = self.get_parameter('use_cuda').value
+                self.cuda_step = self.get_parameter('cuda_step').value
+                self.cuda_ray_step = self.get_parameter('cuda_ray_step').value
                 
-                # Check if within grid bounds
-                if tx < log_odds_grid.shape[1] and ty < log_odds_grid.shape[0]:
-                    # Get grid index
-                    idx = ty * log_odds_grid.shape[1] + tx
-                    
-                    # Default to unknown (-1)
-                    grid_data[idx] = -1
-                    
-                    # Check if cell has enough observations
-                    if observation_count_grid[ty, tx] >= min_observations:
-                        log_odds = log_odds_grid[ty, tx]
-                        
-                        # Classify cell based on log-odds
-                        if log_odds > occupied_threshold:
-                            grid_data[idx] = 100  # Occupied
-                        elif log_odds < free_threshold:
-                            grid_data[idx] = 0    # Free
-                        else:
-                            # Convert log-odds to probability and scale to [0,100]
-                            prob = 1.0 - (1.0 / (1.0 + cuda.exp(log_odds)))
-                            grid_data[idx] = int(prob * 100)
-            """)
-            
-            # Set up optimal block sizes for the GPU
-            self.threads_per_block = (16, 16)  # Optimize for Jetson Orin NX
-            
-            self.get_logger().info("CUDA GPU acceleration kernels compiled successfully")
+                self.get_logger().info(f"CUDA Parameters: use_cuda={self.use_cuda}, cuda_step={self.cuda_step}, cuda_ray_step={self.cuda_ray_step}")
+            else:
+                self.get_logger().error("CUDA accelerator initialized but reports CUDA is not available")
+                CUDA_AVAILABLE = False
             
         except Exception as e:
             self.get_logger().error(f"Error initializing CUDA functions: {e}")
@@ -955,63 +841,67 @@ class ZedOccupancyGridNode(Node):
             # Track ray count for debugging
             ray_count = 0
             
-            # CUDA Acceleration path
-            if CUDA_AVAILABLE:
+            # CUDA Acceleration path using our optimized accelerator
+            if CUDA_AVAILABLE and hasattr(self, 'cuda_accelerator') and hasattr(self, 'use_cuda') and self.use_cuda:
                 try:
-                    self.get_logger().info("Using JETSON ORIN CUDA acceleration for grid update")
+                    self.get_logger().info("Using optimized CUDA acceleration module for grid update")
                     
-                    # Transfer depth image to GPU if needed
-                    if not isinstance(depth_image, cp.ndarray):
-                        d_depth_image = cp.asarray(depth_image)
+                    # Create transform data dictionary for the CUDA accelerator
+                    transform_data = {
+                        'rotation_matrix': rotation_matrix,
+                        'camera_pos': camera_pos,
+                        'camera_grid_x': camera_grid_x,
+                        'camera_grid_y': camera_grid_y
+                    }
+                    
+                    # Create grid data dictionary for the CUDA accelerator
+                    grid_data = {
+                        'log_odds_grid': self.log_odds_grid,
+                        'cell_height_grid': self.cell_height_grid,
+                        'observation_count_grid': self.observation_count_grid
+                    }
+                    
+                    # Set up parameters for the CUDA accelerator
+                    params = {
+                        'step': self.cuda_step,  # Use CUDA-specific step size parameter
+                        'min_depth': self.min_depth,
+                        'max_depth': self.max_depth,
+                        'log_odds_free': self.LOG_ODDS_FREE,
+                        'log_odds_occupied': self.LOG_ODDS_OCCUPIED,
+                        'log_odds_min': self.LOG_ODDS_MIN,
+                        'log_odds_max': self.LOG_ODDS_MAX,
+                        'grid_origin_x': self.grid_origin_x,
+                        'grid_origin_y': self.grid_origin_y,
+                        'resolution': self.resolution,
+                        'max_ray_length': self.max_ray_length,
+                        'current_alpha': self.current_alpha,
+                        'temporal_filtering': self.temporal_filtering,
+                        'tan_fov_h': tan_fov_h,
+                        'tan_fov_v': tan_fov_v,
+                        'ray_step': self.cuda_ray_step  # Use CUDA-specific ray step size parameter
+                    }
+                    
+                    # Call the CUDA accelerator to update the grid
+                    result = self.cuda_accelerator.update_grid(depth_image, transform_data, grid_data, params)
+                    
+                    if result:
+                        # Update the grid with the results
+                        self.log_odds_grid = result['log_odds_grid']
+                        self.cell_height_grid = result['cell_height_grid']
+                        self.observation_count_grid = result['observation_count_grid']
+                        
+                        # Log statistics
+                        ray_count = result['stats']['valid_points']
+                        total_time = result['stats']['total_time']
+                        
+                        self.get_logger().info(f"CUDA GPU accelerated: Processed {ray_count} rays in {total_time:.4f} seconds")
                     else:
-                        d_depth_image = depth_image
-                    
-                    # Allocate result array for world points
-                    d_world_points = cp.full((height, width, 3), -1000.0, dtype=cp.float32)
-                    
-                    # Calculate CUDA grid dimensions
-                    blocks_per_grid = ((width + self.threads_per_block[0] - 1) // self.threads_per_block[0],
-                                      (height + self.threads_per_block[1] - 1) // self.threads_per_block[1])
-                    
-                    # Move rotation matrix to GPU
-                    d_rotation_matrix = cp.asarray(rotation_matrix)
-                    d_camera_pos = cp.asarray(camera_pos)
-                    
-                    # Launch kernel to transform depth points to world coordinates
-                    self.transform_points_cuda[blocks_per_grid, self.threads_per_block](
-                        d_depth_image, d_rotation_matrix, d_camera_pos,
-                        width, height, step, tan_fov_h, tan_fov_v,
-                        self.min_depth, self.max_depth, d_world_points
-                    )
-                    
-                    # Move grid arrays to GPU if not already there
-                    d_log_odds_grid = cp.asarray(self.log_odds_grid)
-                    d_cell_height_grid = cp.asarray(self.cell_height_grid)
-                    d_observation_count_grid = cp.asarray(self.observation_count_grid)
-                    
-                    # Launch kernel to update grid from ray endpoints
-                    self.update_endpoints_cuda[blocks_per_grid, self.threads_per_block](
-                        d_world_points, self.grid_origin_x, self.grid_origin_y,
-                        self.resolution, self.grid_cols, self.grid_rows,
-                        camera_x, camera_y, self.max_ray_length,
-                        d_log_odds_grid, d_cell_height_grid, d_observation_count_grid,
-                        self.LOG_ODDS_OCCUPIED, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX,
-                        self.current_alpha, self.temporal_filtering
-                    )
-                    
-                    # Synchronize to ensure all operations are complete
-                    cp.cuda.runtime.deviceSynchronize()
-                    
-                    # Copy results back to CPU
-                    self.log_odds_grid = d_log_odds_grid.get()
-                    self.cell_height_grid = d_cell_height_grid.get()
-                    self.observation_count_grid = d_observation_count_grid.get()
-                    
-                    # Count valid rays for debugging
-                    ray_count = cp.sum(d_world_points[:, :, 0] != -1000.0).get()
-                    
-                    self.get_logger().info(f"CUDA GPU accelerated: Processed {ray_count} rays using Jetson Orin")
-                    
+                        self.get_logger().error("CUDA acceleration failed, falling back to CPU")
+                        ray_count = self._update_grid_cpu(
+                            depth_image, camera_grid_x, camera_grid_y, 
+                            height, width, step, rotation_matrix,
+                            camera_x, camera_y, camera_z, tan_fov_h, tan_fov_v
+                        )
                 except Exception as e:
                     self.get_logger().error(f"Error in CUDA acceleration: {e}")
                     self.get_logger().warn("Falling back to CPU implementation")

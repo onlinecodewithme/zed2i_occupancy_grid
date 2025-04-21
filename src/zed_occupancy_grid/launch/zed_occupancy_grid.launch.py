@@ -164,7 +164,11 @@ def generate_launch_description():
             'moving_alpha': 0.2,  # Less temporal filtering when moving (more responsive)
             'static_alpha': 0.6,  # Less temporal filtering even when static
             'min_observations': 1,  # Allow quicker updates
-            'use_sim_time': False
+            'use_sim_time': False,
+            # CUDA acceleration parameters
+            'use_cuda': True,
+            'cuda_step': 4,  # Process 1 out of every 4 pixels (for speed)
+            'cuda_ray_step': 2  # Ray tracing step size on GPU
         }]
         # Removing problematic QoS overrides - we'll handle QoS in the node itself
     )
