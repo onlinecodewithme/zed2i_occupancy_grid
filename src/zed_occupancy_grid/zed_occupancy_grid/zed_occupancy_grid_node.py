@@ -14,22 +14,98 @@ import time
 import threading
 import math
 
+# ANSI color codes for terminal output
+GREEN = '\033[92m'
+RED = '\033[91m'
+YELLOW = '\033[93m'
+CYAN = '\033[96m'
+BOLD = '\033[1m'
+END = '\033[0m'
+
+# CUDA and GPU acceleration imports
+try:
+    from . import cuda_acceleration
+    CUDA_AVAILABLE = cuda_acceleration.CUDA_AVAILABLE
+    if CUDA_AVAILABLE:
+        print(f"\n{GREEN}{BOLD}========================================{END}")
+        print(f"{GREEN}{BOLD}✓ CUDA ACCELERATION ENABLED AND ACTIVE ✓{END}")
+        print(f"{GREEN}{BOLD}========================================{END}")
+        print(f"{GREEN}✓ CUDA acceleration module imported successfully!{END}")
+    else:
+        print(f"\n{YELLOW}{BOLD}=========================================={END}")
+        print(f"{YELLOW}{BOLD}⚠ CUDA DISABLED - USING CPU PROCESSING ⚠{END}")
+        print(f"{YELLOW}{BOLD}=========================================={END}")
+        print(f"{YELLOW}⚠ CUDA module imported but GPU not available!{END}")
+except ImportError as e:
+    CUDA_AVAILABLE = False
+    print(f"\n{RED}{BOLD}=========================================={END}")
+    print(f"{RED}{BOLD}❌ CUDA UNAVAILABLE - USING CPU FALLBACK ❌{END}")
+    print(f"{RED}{BOLD}=========================================={END}")
+    print(f"{RED}❌ Error: {str(e)}{END}")
+    print(f"{RED}❌ Falling back to CPU processing (slower){END}")
+
 class ZedOccupancyGridNode(Node):
     def __init__(self):
         super().__init__('zed_occupancy_grid_node')
+
+        # Check CUDA availability for GPU acceleration
+        if CUDA_AVAILABLE:
+            self.get_logger().info("CUDA GPU acceleration is ENABLED - Using JETSON ORIN NX Acceleration!")
+            # Initialize CUDA context and compile kernels
+            self.initialize_cuda_functions()
+        else:
+            self.get_logger().warn("CUDA is not available - using CPU fallback")
+    
+    def initialize_cuda_functions(self):
+        """Initialize CUDA accelerator for GPU-accelerated processing"""
+        global CUDA_AVAILABLE
+        
+        if not CUDA_AVAILABLE:
+            return
+        
+        try:
+            # Initialize our optimized CUDA accelerator
+            from . import cuda_acceleration
+            
+            # Create the accelerator instance with our logger
+            self.cuda_accelerator = cuda_acceleration.CudaAccelerator(self.get_logger())
+            
+            # Check if CUDA is really available
+            if self.cuda_accelerator.is_available():
+                self.get_logger().info("CUDA GPU acceleration initialized successfully with optimal settings")
+                
+                # Add CUDA-specific parameters
+                self.declare_parameter('use_cuda', True)
+                self.declare_parameter('cuda_step', 4)  # Step size for CUDA processing (higher = faster but less detail)
+                self.declare_parameter('cuda_ray_step', 2)  # Step size for ray tracing on GPU
+                
+                # Get parameters
+                self.use_cuda = self.get_parameter('use_cuda').value
+                self.cuda_step = self.get_parameter('cuda_step').value
+                self.cuda_ray_step = self.get_parameter('cuda_ray_step').value
+                
+                self.get_logger().info(f"CUDA Parameters: use_cuda={self.use_cuda}, cuda_step={self.cuda_step}, cuda_ray_step={self.cuda_ray_step}")
+            else:
+                self.get_logger().error("CUDA accelerator initialized but reports CUDA is not available")
+                CUDA_AVAILABLE = False
+            
+        except Exception as e:
+            self.get_logger().error(f"Error initializing CUDA functions: {e}")
+            self.get_logger().warn("Falling back to CPU-based processing")
+            CUDA_AVAILABLE = False
         
         # Set ROS logging to DEBUG to get all messages
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
         
-        # Occupancy probabilities - using log-odds for numerical stability
+        # POINT CLOUD MAP: Adjust parameters to create sparse point-based map like image 2
         # P(occupied) = 1 - 1/(1 + exp(l))
-        self.FREE_THRESHOLD = -2.0  # log-odds threshold for considering a cell free
-        self.OCCUPIED_THRESHOLD = 2.0  # log-odds threshold for considering a cell occupied
-        self.LOG_ODDS_PRIOR = 0.0  # log-odds of prior probability (0.5)
-        self.LOG_ODDS_FREE = -1.5  # log-odds update for free cells (MORE AGGRESSIVE)
-        self.LOG_ODDS_OCCUPIED = 3.0  # log-odds update for occupied cells (MORE AGGRESSIVE)
-        self.LOG_ODDS_MIN = -5.0  # minimum log-odds value
-        self.LOG_ODDS_MAX = 5.0  # maximum log-odds value
+        self.FREE_THRESHOLD = -3.0    # CRITICAL: Much lower threshold so few cells marked as free
+        self.OCCUPIED_THRESHOLD = 0.1  # CRITICAL: Very low threshold to detect obstacles easily
+        self.LOG_ODDS_PRIOR = 0.0      # log-odds of prior probability (0.5)
+        self.LOG_ODDS_FREE = -0.1      # CRITICAL: Very weak free space marking to prevent filling
+        self.LOG_ODDS_OCCUPIED = 2.0   # Moderate obstacle marking to create point-like obstacles
+        self.LOG_ODDS_MIN = -5.0       # Standard minimum
+        self.LOG_ODDS_MAX = 5.0        # Standard maximum
         
         # Map persistence settings
         self.map_persistence_enabled = True
@@ -709,6 +785,7 @@ class ZedOccupancyGridNode(Node):
         """
         Update the log-odds grid using the depth image and camera transform.
         Uses probabilistic updates for better map quality.
+        JETSON ORIN GPU-accelerated when CUDA is available.
         """
         # DEBUG: Add logging to track function entry
         self.get_logger().info("Entering update_grid_from_depth")
@@ -734,6 +811,7 @@ class ZedOccupancyGridNode(Node):
         camera_x = transform.transform.translation.x
         camera_y = transform.transform.translation.y
         camera_z = transform.transform.translation.z
+        camera_pos = np.array([camera_x, camera_y, camera_z], dtype=np.float32)
         
         # Camera parameters - ZED2i camera
         fov_horizontal = 110.0 * np.pi / 180.0  # radians
@@ -765,8 +843,8 @@ class ZedOccupancyGridNode(Node):
         rotation_matrix[2, 2] = 1.0 - 2.0 * (qx * qx + qy * qy)
         
         # EXTREME PERFORMANCE OPTIMIZATION for real-time updates
-        # Use an extremely aggressive fixed step size for real-time performance
-        step = 24  # Process only 1/24 of pixels - focused on speed over detail
+        # Use an incredibly aggressive fixed step size for maximum performance
+        step = 32  # MODIFIED: Process only 1/32 of pixels - ultra-focused on speed over detail
         
         # Precompute camera position in grid coordinates
         camera_grid_x = int((camera_x - self.grid_origin_x) / self.resolution)
@@ -778,66 +856,154 @@ class ZedOccupancyGridNode(Node):
         
         # Use a simpler direct approach to ensure reliability
         with self.grid_lock:  # Thread safety
-            ray_count = 0  # Track rays for debugging
+            # Track ray count for debugging
+            ray_count = 0
             
-            # Process image in a simple loop approach
-            for v in range(0, height, step):
-                for u in range(0, width, step):
-                    # Get depth value
-                    depth = depth_image[v, u]
+            # CUDA Acceleration path using our optimized accelerator
+            if CUDA_AVAILABLE and hasattr(self, 'cuda_accelerator') and hasattr(self, 'use_cuda') and self.use_cuda:
+                try:
+                    self.get_logger().info("Using optimized CUDA acceleration module for grid update")
                     
-                    # Skip invalid depth values
-                    if not np.isfinite(depth) or depth < self.min_depth or depth > self.max_depth:
-                        continue
+                    # Create transform data dictionary for the CUDA accelerator
+                    transform_data = {
+                        'rotation_matrix': rotation_matrix,
+                        'camera_pos': camera_pos,
+                        'camera_grid_x': camera_grid_x,
+                        'camera_grid_y': camera_grid_y
+                    }
                     
-                    # Calculate normalized image coordinates
-                    normalized_u = (2.0 * u / width - 1.0)
-                    normalized_v = (2.0 * v / height - 1.0)
+                    # Create grid data dictionary for the CUDA accelerator
+                    grid_data = {
+                        'log_odds_grid': self.log_odds_grid,
+                        'cell_height_grid': self.cell_height_grid,
+                        'observation_count_grid': self.observation_count_grid
+                    }
                     
-                    # Calculate 3D vector from camera using field of view
-                    ray_x = normalized_u * tan_fov_h * depth
-                    ray_y = normalized_v * tan_fov_v * depth
-                    ray_z = depth
+                    # Set up parameters for the CUDA accelerator
+                    params = {
+                        'step': self.cuda_step,  # Use CUDA-specific step size parameter
+                        'min_depth': self.min_depth,
+                        'max_depth': self.max_depth,
+                        'log_odds_free': self.LOG_ODDS_FREE,
+                        'log_odds_occupied': self.LOG_ODDS_OCCUPIED,
+                        'log_odds_min': self.LOG_ODDS_MIN,
+                        'log_odds_max': self.LOG_ODDS_MAX,
+                        'grid_origin_x': self.grid_origin_x,
+                        'grid_origin_y': self.grid_origin_y,
+                        'resolution': self.resolution,
+                        'max_ray_length': self.max_ray_length,
+                        'current_alpha': self.current_alpha,
+                        'temporal_filtering': self.temporal_filtering,
+                        'tan_fov_h': tan_fov_h,
+                        'tan_fov_v': tan_fov_v,
+                        'ray_step': self.cuda_ray_step  # Use CUDA-specific ray step size parameter
+                    }
                     
-                    # Transform ray from camera to world coordinates
-                    world_x = (rotation_matrix[0, 0] * ray_x +
-                              rotation_matrix[0, 1] * ray_y +
-                              rotation_matrix[0, 2] * ray_z) + camera_x
+                    # Call the CUDA accelerator to update the grid
+                    result = self.cuda_accelerator.update_grid(depth_image, transform_data, grid_data, params)
                     
-                    world_y = (rotation_matrix[1, 0] * ray_x +
-                              rotation_matrix[1, 1] * ray_y +
-                              rotation_matrix[1, 2] * ray_z) + camera_y
+                    if result:
+                        # Update the grid with the results
+                        self.log_odds_grid = result['log_odds_grid']
+                        self.cell_height_grid = result['cell_height_grid']
+                        self.observation_count_grid = result['observation_count_grid']
+                        
+                        # Log statistics
+                        ray_count = result['stats']['valid_points']
+                        total_time = result['stats']['total_time']
+                        
+                        self.get_logger().info(f"CUDA GPU accelerated: Processed {ray_count} rays in {total_time:.4f} seconds")
+                    else:
+                        self.get_logger().error("CUDA acceleration failed, falling back to CPU")
+                        ray_count = self._update_grid_cpu(
+                            depth_image, camera_grid_x, camera_grid_y, 
+                            height, width, step, rotation_matrix,
+                            camera_x, camera_y, camera_z, tan_fov_h, tan_fov_v
+                        )
+                except Exception as e:
+                    self.get_logger().error(f"Error in CUDA acceleration: {e}")
+                    self.get_logger().warn("Falling back to CPU implementation")
                     
-                    world_z = (rotation_matrix[2, 0] * ray_x +
-                              rotation_matrix[2, 1] * ray_y +
-                              rotation_matrix[2, 2] * ray_z) + camera_z
-                    
-                    # Skip points that are too far from camera
-                    if np.sqrt((world_x - camera_x)**2 + (world_y - camera_y)**2) > self.max_ray_length:
-                        continue
-                    
-                    # Convert world coordinates to grid cell coordinates
-                    grid_x = int((world_x - self.grid_origin_x) / self.resolution)
-                    grid_y = int((world_y - self.grid_origin_y) / self.resolution)
-                    
-                    # Skip if out of grid bounds
-                    if (grid_x < 0 or grid_x >= self.grid_cols or
-                        grid_y < 0 or grid_y >= self.grid_rows):
-                        continue
-                    
-                    # Bresenham ray-tracing from camera to point
-                    # This marks cells along the ray as free, and the endpoint as occupied
-                    self.raytrace_bresenham(
-                        camera_grid_x, camera_grid_y,
-                        grid_x, grid_y, world_z)
-                    
-                    ray_count += 1
+                    # Fall back to CPU implementation
+                    ray_count = self._update_grid_cpu(
+                        depth_image, camera_grid_x, camera_grid_y, 
+                        height, width, step, rotation_matrix,
+                        camera_x, camera_y, camera_z, tan_fov_h, tan_fov_v
+                    )
+            else:
+                # CPU implementation - use the standard algorithm
+                ray_count = self._update_grid_cpu(
+                    depth_image, camera_grid_x, camera_grid_y, 
+                    height, width, step, rotation_matrix,
+                    camera_x, camera_y, camera_z, tan_fov_h, tan_fov_v
+                )
             
-            # DEBUG: Log how many rays were processed only if significant
+            # DEBUG: Log how many rays were processed
             if ray_count > 0:
                 self.get_logger().info(f"Processed {ray_count} rays in update_grid_from_depth")
             else:
                 self.get_logger().warn("No valid rays processed! Check depth data and transforms.")
+                
+    def _update_grid_cpu(self, depth_image, camera_grid_x, camera_grid_y, 
+                          height, width, step, rotation_matrix,
+                          camera_x, camera_y, camera_z, tan_fov_h, tan_fov_v):
+        """CPU implementation of the grid update (used as fallback when CUDA fails)"""
+        ray_count = 0
+        
+        # Process image in a simple loop approach
+        for v in range(0, height, step):
+            for u in range(0, width, step):
+                # Get depth value
+                depth = depth_image[v, u]
+                
+                # Skip invalid depth values
+                if not np.isfinite(depth) or depth < self.min_depth or depth > self.max_depth:
+                    continue
+                
+                # Calculate normalized image coordinates
+                normalized_u = (2.0 * u / width - 1.0)
+                normalized_v = (2.0 * v / height - 1.0)
+                
+                # Calculate 3D vector from camera using field of view
+                ray_x = normalized_u * tan_fov_h * depth
+                ray_y = normalized_v * tan_fov_v * depth
+                ray_z = depth
+                
+                # Transform ray from camera to world coordinates
+                world_x = (rotation_matrix[0, 0] * ray_x +
+                          rotation_matrix[0, 1] * ray_y +
+                          rotation_matrix[0, 2] * ray_z) + camera_x
+                
+                world_y = (rotation_matrix[1, 0] * ray_x +
+                          rotation_matrix[1, 1] * ray_y +
+                          rotation_matrix[1, 2] * ray_z) + camera_y
+                
+                world_z = (rotation_matrix[2, 0] * ray_x +
+                          rotation_matrix[2, 1] * ray_y +
+                          rotation_matrix[2, 2] * ray_z) + camera_z
+                
+                # Skip points that are too far from camera
+                if np.sqrt((world_x - camera_x)**2 + (world_y - camera_y)**2) > self.max_ray_length:
+                    continue
+                
+                # Convert world coordinates to grid cell coordinates
+                grid_x = int((world_x - self.grid_origin_x) / self.resolution)
+                grid_y = int((world_y - self.grid_origin_y) / self.resolution)
+                
+                # Skip if out of grid bounds
+                if (grid_x < 0 or grid_x >= self.grid_cols or
+                    grid_y < 0 or grid_y >= self.grid_rows):
+                    continue
+                
+                # Bresenham ray-tracing from camera to point
+                # This marks cells along the ray as free, and the endpoint as occupied
+                self.raytrace_bresenham(
+                    camera_grid_x, camera_grid_y,
+                    grid_x, grid_y, world_z)
+                
+                ray_count += 1
+                
+        return ray_count
     
     def raytrace_bresenham(self, x0, y0, x1, y1, point_height):
         """
@@ -861,9 +1027,9 @@ class ZedOccupancyGridNode(Node):
         traveled = 0
         total_distance = np.sqrt(dx**2 + dy**2)
         
-        # EXTREME OPTIMIZATION: Super-fast ray tracing 
-        # Skip many points along the ray for real-time performance
-        ray_sampling = 4  # Process only every 4th point along the ray for massive speedup
+        # EXTREME OPTIMIZATION: Ultra-fast ray tracing 
+        # Skip many points along the ray for maximum performance
+        ray_sampling = 8  # MODIFIED: Process only every 8th point along the ray for extreme performance
         count = 0
         
         # Ray tracing
