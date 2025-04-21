@@ -34,5 +34,5 @@ ros2 launch zed_occupancy_grid zed_occupancy_grid.launch.py \
   grid_height:=15.0 \
   min_depth:=0.3 \
   max_depth:=20.0 \
-  position_change_threshold:=0.001 \
-  rotation_change_threshold:=0.001
+  position_change_threshold:=0.00001 \
+  rotation_change_threshold:=0.00001

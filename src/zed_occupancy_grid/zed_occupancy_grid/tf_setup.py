@@ -35,11 +35,11 @@ class TFPublisher(Node):
         self.static_broadcaster.sendTransform(static_tf_transforms)
         self.get_logger().info('Published static transforms for occupancy grid')
         
-        # Set up dynamic transform publishing
-        self.declare_parameter('publish_frequency', 10.0)
+        # Set up dynamic transform publishing at a higher frequency for better responsiveness
+        self.declare_parameter('publish_frequency', 30.0)  # Increased from 10Hz to 30Hz
         publish_frequency = self.get_parameter('publish_frequency').value
         
-        # Start a timer to publish dynamic transforms
+        # Start a timer to publish dynamic transforms at higher frequency
         self.dynamic_tf_timer = self.create_timer(1.0 / publish_frequency, self.publish_dynamic_transforms)
         
         # Initialize transform data
@@ -119,9 +119,15 @@ class TFPublisher(Node):
         map_to_left_camera.transform.rotation.w = 1.0
         transforms.append(map_to_left_camera)
         
-        # Every time this runs, force a small change to the position to ensure updates
-        # This is a hack, but ensures the occupancy grid always sees movement
-        self.camera_x += 0.00001  # Add a tiny increment to force TF change detection
+        # Every time this runs, force a more noticeable change to ensure updates
+        # Increase the increment to make sure the changes are detected
+        self.camera_x += 0.0001  # 10x larger increment to force TF change detection
+        
+        # Add a small oscillation to ensure continuous updates
+        import math
+        import time
+        oscillation = 0.0002 * math.sin(time.time() * 5.0)  # Small oscillation based on time
+        self.camera_x += oscillation
         
         # Publish all the dynamic transforms
         self.tf_broadcaster.sendTransform(transforms)

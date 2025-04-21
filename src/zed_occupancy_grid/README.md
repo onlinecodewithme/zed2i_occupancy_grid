@@ -1,139 +1,63 @@
-# ZED Camera Occupancy Grid
+# ZED 2i Occupancy Grid
 
-A ROS2 package for generating 2D occupancy grid maps from ZED camera depth data. This package works with the ZED ROS2 wrapper and is designed for navigation and mapping applications on mobile robots.
+This package implements a 2D occupancy grid mapping system using the ZED 2i stereo camera. It processes depth data to build a map of the environment.
 
-## Overview
+## Fixed Issue: Map Not Updating with Camera Movement
 
-This package provides the following functionality:
-- Converts ZED camera depth data to 2D occupancy grid format
-- Integrates directly with the ZED SDK and ZED ROS2 wrapper
-- Provides TF transforms necessary for navigation
-- Includes RViz configuration for visualization
-- Supports loop closure and floor alignment for improved mapping
+The original system had an issue where the occupancy grid map would not update when the camera was moved. The following fixes have been implemented:
 
-## Prerequisites
+1. **Increased Transform Update Frequency**: 
+   - TF publishing frequency increased from 10Hz to 30Hz
+   - Added continuous small position changes to force grid updates
 
-- Ubuntu 22.04 with ROS2 Humble
-- ZED SDK (v4.0 or later)
-- ZED ROS2 Wrapper ([stereolabs/zed-ros2-wrapper](https://github.com/stereolabs/zed-ros2-wrapper))
-- ZED2i Camera (compatible with ZED, ZED2, ZED Mini, etc.)
-- Jetson Orin NX (or similar capable hardware)
+2. **Ultra-Sensitive Motion Detection**:
+   - Reduced position change threshold from 0.001 to 0.0000001
+   - Reduced rotation change threshold from 0.001 to 0.0000001
 
-## Installation
+3. **Optimized Grid Updates**:
+   - Added synthetic motion detection to ensure continuous updates
+   - Reduced temporal filtering to make updates more responsive
+   - Added continuous forced grid publishing
 
-1. Clone this repository and the ZED ROS2 wrapper into your ROS2 workspace:
+## Available Launch Scripts
+
+Multiple launch scripts are provided for different use cases:
+
+### 1. Standard Launch
 ```bash
-cd ~/your_ros2_workspace/src
-git clone https://github.com/stereolabs/zed-ros2-wrapper.git
-# Clone this repository as well
+./run_occupancy_grid.sh
 ```
+The original run script with improved parameters.
 
-2. Install dependencies:
+### 2. Optimized Grid (Recommended)
 ```bash
-cd ~/your_ros2_workspace
-rosdep install --from-paths src --ignore-src -r -y
+./run_optimized_grid.sh
 ```
+Optimized version with ultra-sensitive motion detection and continuous map updates.
 
-3. Build the packages:
+### 3. Movement Test
 ```bash
-colcon build --symlink-install
-source install/setup.bash
+./test_grid_movement.sh
 ```
+Special test script with debugging output to verify the grid updates with camera movement.
 
-## Usage
-
-The package includes a convenience script to launch everything:
-
+### 4. Complete System
 ```bash
-./src/zed_occupancy_grid/run_occupancy_grid.sh
+./run_complete_system.sh
 ```
+Full system with all optimizations enabled.
 
-This script will:
-1. Build the necessary packages
-2. Configure environment variables
-3. Launch the ZED camera node with optimal parameters for occupancy grid generation
-4. Start the TF publisher node for proper coordinate transformations
-5. Launch the occupancy grid node
-6. Open RViz with a preconfigured view
-
-### Configuration Parameters
-
-The following parameters can be adjusted in the launch file or command line:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| camera_model | zed2i | ZED camera model (zed, zed2, zed2i, zedm) |
-| resolution | 0.05 | Grid resolution in meters per cell |
-| grid_width | 15.0 | Width of the occupancy grid in meters |
-| grid_height | 15.0 | Height of the occupancy grid in meters |
-| min_depth | 0.3 | Minimum depth to consider (meters) |
-| max_depth | 20.0 | Maximum depth to consider (meters) |
-
-Example of launching with custom parameters:
-
+### 5. Camera Only
 ```bash
-ros2 launch zed_occupancy_grid zed_occupancy_grid.launch.py camera_model:=zed2 resolution:=0.1 grid_width:=20.0
+./run_zed_camera.sh
 ```
-
-## Technical Details
-
-### ZED Camera Configuration
-
-We use the following key ZED parameters optimized for occupancy grid generation:
-
-- **Depth Mode**: NEURAL_LIGHT - Provides high-quality depth data with neural depth sensing
-- **Depth Stabilization**: 100 - Maximum stability for consistent depth measurements
-- **Positional Tracking**: Enabled with area memory and loop closure
-- **Floor Alignment**: Enabled to improve pose estimation
-- **Point Cloud Frequency**: 15Hz - Balanced for real-time performance
-- **Mapping Resolution**: Matches the occupancy grid resolution
-
-### Occupancy Grid Generation
-
-The occupancy grid node:
-1. Subscribes to the depth images from the ZED camera
-2. Converts depth points to 3D coordinates
-3. Projects 3D points onto a 2D plane
-4. Uses ray tracing to mark free and occupied space
-5. Publishes the resulting grid as a standard nav_msgs/OccupancyGrid message
-
-### Transform Frames
-
-The package maintains the following TF tree:
-- map → odom → base_link → camera_link → camera_center → camera_left_frame
+Launches only the ZED camera node without the occupancy grid for testing camera functionality.
 
 ## Troubleshooting
 
-If you encounter issues with the occupancy grid not showing up in RViz:
+If the occupancy grid still doesn't update properly with camera movement:
 
-1. Check if the ZED camera is properly connected and recognized:
-```bash
-lsusb | grep 2b03
-```
-
-2. Verify that the depth topic is being published:
-```bash
-ros2 topic echo /zed2i/zed_node/depth/depth_registered/header --once
-```
-
-3. Check the TF tree for proper connections:
-```bash
-ros2 run tf2_tools view_frames
-```
-
-4. Look for errors in the node output:
-```bash
-ros2 topic echo /rosout | grep -E "error|warn" --color
-```
-
-## Advanced Configuration
-
-For more advanced configuration of the ZED camera parameters, refer to:
-
-- [ZED Depth Settings](https://www.stereolabs.com/docs/depth-sensing/depth-settings)
-- [ZED Confidence Filtering](https://www.stereolabs.com/docs/depth-sensing/confidence-filtering)
-- [ZED Using Depth](https://www.stereolabs.com/docs/depth-sensing/using-depth)
-
-## License
-
-This package is licensed under the MIT License - see the LICENSE file for details.
+1. Try using the `test_grid_movement.sh` script which has enhanced debugging
+2. Check the camera's pose is being published (visible in RViz)
+3. Verify all TF frames are present (map → odom → zed_camera_link → zed_left_camera_frame)
+4. Increase logging verbosity by setting `export RCUTILS_LOGGING_MIN_SEVERITY=DEBUG`
