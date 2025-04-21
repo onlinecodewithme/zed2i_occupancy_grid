@@ -21,15 +21,15 @@ class ZedOccupancyGridNode(Node):
         # Set ROS logging to DEBUG to get all messages
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
         
-        # Occupancy probabilities - using log-odds for numerical stability
+        # OBSTACLE VISIBILITY ENHANCEMENT: Adjust occupancy probabilities for clearer obstacles
         # P(occupied) = 1 - 1/(1 + exp(l))
-        self.FREE_THRESHOLD = -2.0  # log-odds threshold for considering a cell free
-        self.OCCUPIED_THRESHOLD = 2.0  # log-odds threshold for considering a cell occupied
-        self.LOG_ODDS_PRIOR = 0.0  # log-odds of prior probability (0.5)
-        self.LOG_ODDS_FREE = -1.5  # log-odds update for free cells (MORE AGGRESSIVE)
-        self.LOG_ODDS_OCCUPIED = 3.0  # log-odds update for occupied cells (MORE AGGRESSIVE)
-        self.LOG_ODDS_MIN = -5.0  # minimum log-odds value
-        self.LOG_ODDS_MAX = 5.0  # maximum log-odds value
+        self.FREE_THRESHOLD = -1.5  # MODIFIED: Less strict threshold for free cells
+        self.OCCUPIED_THRESHOLD = 1.0  # MODIFIED: Much lower threshold to make obstacles appear faster/easier
+        self.LOG_ODDS_PRIOR = 0.0    # log-odds of prior probability (0.5)
+        self.LOG_ODDS_FREE = -0.8    # MODIFIED: Less aggressive free cell updates to prevent washing out obstacles
+        self.LOG_ODDS_OCCUPIED = 4.5 # MODIFIED: MUCH more aggressive occupied updates for strong obstacle marking
+        self.LOG_ODDS_MIN = -4.0     # MODIFIED: Less extreme minimum to keep contrast
+        self.LOG_ODDS_MAX = 8.0      # MODIFIED: Higher maximum to allow obstacles to stand out more
         
         # Map persistence settings
         self.map_persistence_enabled = True
@@ -765,8 +765,8 @@ class ZedOccupancyGridNode(Node):
         rotation_matrix[2, 2] = 1.0 - 2.0 * (qx * qx + qy * qy)
         
         # EXTREME PERFORMANCE OPTIMIZATION for real-time updates
-        # Use an extremely aggressive fixed step size for real-time performance
-        step = 24  # Process only 1/24 of pixels - focused on speed over detail
+        # Use an incredibly aggressive fixed step size for maximum performance
+        step = 32  # MODIFIED: Process only 1/32 of pixels - ultra-focused on speed over detail
         
         # Precompute camera position in grid coordinates
         camera_grid_x = int((camera_x - self.grid_origin_x) / self.resolution)
@@ -861,9 +861,9 @@ class ZedOccupancyGridNode(Node):
         traveled = 0
         total_distance = np.sqrt(dx**2 + dy**2)
         
-        # EXTREME OPTIMIZATION: Super-fast ray tracing 
-        # Skip many points along the ray for real-time performance
-        ray_sampling = 4  # Process only every 4th point along the ray for massive speedup
+        # EXTREME OPTIMIZATION: Ultra-fast ray tracing 
+        # Skip many points along the ray for maximum performance
+        ray_sampling = 8  # MODIFIED: Process only every 8th point along the ray for extreme performance
         count = 0
         
         # Ray tracing
