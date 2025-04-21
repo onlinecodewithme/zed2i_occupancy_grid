@@ -97,15 +97,15 @@ class ZedOccupancyGridNode(Node):
         # Set ROS logging to DEBUG to get all messages
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
         
-        # POINT CLOUD MAP: Adjust parameters to create sparse point-based map like image 2
+        # WALL-BASED MAP: Optimized parameters for solid walls and navigation
         # P(occupied) = 1 - 1/(1 + exp(l))
-        self.FREE_THRESHOLD = -3.0    # CRITICAL: Much lower threshold so few cells marked as free
-        self.OCCUPIED_THRESHOLD = 0.1  # CRITICAL: Very low threshold to detect obstacles easily
-        self.LOG_ODDS_PRIOR = 0.0      # log-odds of prior probability (0.5)
-        self.LOG_ODDS_FREE = -0.1      # CRITICAL: Very weak free space marking to prevent filling
-        self.LOG_ODDS_OCCUPIED = 2.0   # Moderate obstacle marking to create point-like obstacles
-        self.LOG_ODDS_MIN = -5.0       # Standard minimum
-        self.LOG_ODDS_MAX = 5.0        # Standard maximum
+        self.FREE_THRESHOLD = -1.5     # Higher threshold to better distinguish free space
+        self.OCCUPIED_THRESHOLD = 1.0   # Higher threshold for more confident obstacle marking
+        self.LOG_ODDS_PRIOR = 0.0       # log-odds of prior probability (0.5)
+        self.LOG_ODDS_FREE = -0.8       # Stronger free space marking to create clear corridors
+        self.LOG_ODDS_OCCUPIED = 3.5    # Stronger obstacle marking for solid walls
+        self.LOG_ODDS_MIN = -5.0        # Standard minimum
+        self.LOG_ODDS_MAX = 5.0         # Standard maximum
         
         # Map persistence settings
         self.map_persistence_enabled = True

@@ -31,12 +31,12 @@ export RCUTILS_COLORIZED_OUTPUT=1
 export RCUTILS_LOGGING_USE_STDOUT=1
 export RCUTILS_LOGGING_BUFFERED_STREAM=1
 
-# Launch the ZED camera with occupancy grid
-echo "Launching ZED Occupancy Grid..."
+# Launch the ZED camera with occupancy grid optimized for navigation
+echo "Launching ZED Occupancy Grid with wall-optimized settings..."
 ros2 launch zed_occupancy_grid zed_occupancy_grid.launch.py \
   camera_model:=zed2i \
-  resolution:=0.05 \
+  resolution:=0.03 \
   grid_width:=15.0 \
   grid_height:=15.0 \
   min_depth:=0.3 \
-  max_depth:=20.0
+  max_depth:=15.0
