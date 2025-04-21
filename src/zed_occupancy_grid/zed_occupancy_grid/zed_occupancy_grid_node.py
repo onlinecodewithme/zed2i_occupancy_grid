@@ -94,17 +94,17 @@ class ZedOccupancyGridNode(Node):
         # Parameters for map updates with camera motion - EXTREME SENSITIVITY FOR DYNAMIC UPDATES
         self.last_camera_position = None     # Track camera position to detect movement
         self.declare_parameter('position_change_threshold', 0.0001)  # Ultra sensitive - detect almost any change 
-        self.position_change_threshold = 0.0  # ZERO THRESHOLD - ANY MOVEMENT WILL BE DETECTED
+        self.position_change_threshold = 0.0001  # MODIFIED: Small but non-zero threshold for stable detection
         self.declare_parameter('rotation_change_threshold', 0.0001)  # Ultra sensitive
-        self.rotation_change_threshold = 0.0  # ZERO THRESHOLD - ANY ROTATION WILL BE DETECTED
+        self.rotation_change_threshold = 0.0001  # MODIFIED: Small but non-zero threshold for stable detection
         self.reset_cells_on_movement = True   # Enable resetting cells that become out of view
-        self.camera_motion_detected = False   # Flag to indicate if camera has moved
+        self.camera_motion_detected = True    # MODIFIED: Always consider camera in motion to ensure updates
         self.last_camera_quaternion = None    # Track camera rotation
-        self.get_logger().info("!!! EXTREMELY SENSITIVE MOTION DETECTION ENABLED !!!")
+        self.get_logger().info("!!! ALWAYS UPDATING OCCUPANCY GRID - CAMERA ALWAYS CONSIDERED MOVING !!!")
         
-        # Camera movement adaptation settings - MORE RESPONSIVE
-        self.static_alpha = 0.7              # Less temporal filtering even when static (0.7 instead of 0.9)
-        self.moving_alpha = 0.3              # Much less filtering when moving (0.3 instead of 0.5)
+        # Camera movement adaptation settings - SUPER RESPONSIVE
+        self.static_alpha = 0.3              # MODIFIED: Less temporal filtering when static for faster updates
+        self.moving_alpha = 0.1              # MODIFIED: Almost no temporal filtering when moving for immediate updates
         self.current_alpha = self.moving_alpha # Start with moving settings for faster updates
 
         # Initialize CV bridge for image conversion
@@ -146,17 +146,17 @@ class ZedOccupancyGridNode(Node):
         self.tf_subscriber = self.create_timer(0.1, self.check_tf_callback)  # 10Hz TF checks
         
         # Add high-frequency forced updates
-        self.force_update_timer = self.create_timer(1.0, self.force_update_callback)  # Force update every second
+        self.force_update_timer = self.create_timer(0.5, self.force_update_callback)  # MODIFIED: Force update every 0.5 seconds
             
         # Create a publisher for debug info
         from std_msgs.msg import String
         self.debug_pub = self.create_publisher(String, '/zed_grid_debug', 10)
             
-        # Add rate limiting with separate update/publish cycles - FASTER UPDATES
+        # Add rate limiting with separate update/publish cycles - MAXIMUM SPEED UPDATES
         self.last_publish_time = 0.0
-        self.publish_period = 0.1            # 10Hz publishing for better responsiveness
+        self.publish_period = 0.05           # MODIFIED: 20Hz publishing for instant responsiveness
         self.last_update_time = 0.0
-        self.update_period = 0.05            # 20Hz processing for immediate updates
+        self.update_period = 0.01            # MODIFIED: 100Hz processing for immediate updates
         
         # Add a mutex for thread safety
         self.grid_lock = threading.Lock()
@@ -165,10 +165,10 @@ class ZedOccupancyGridNode(Node):
         self.last_grid_msg = None
         
         # Create a timer for regular map updates (even with no new data)
-        self.map_timer = self.create_timer(0.2, self.publish_map_timer_callback)  # 5Hz timer
+        self.map_timer = self.create_timer(0.1, self.publish_map_timer_callback)  # MODIFIED: 10Hz timer for more frequent updates
         
         # Create a special timer that always logs camera position regardless of movement
-        self.camera_monitor_timer = self.create_timer(0.5, self.camera_monitor_callback)  # 2Hz timer
+        self.camera_monitor_timer = self.create_timer(0.2, self.camera_monitor_callback)  # MODIFIED: 5Hz timer for more frequent checks
 
         # TF buffer and listener
         self.tf_buffer = tf2_ros.Buffer(rclpy.duration.Duration(seconds=10.0))  # Larger buffer
@@ -187,6 +187,9 @@ class ZedOccupancyGridNode(Node):
             # Force update every time
             self.last_update_time = current_time
             self.get_logger().warn("DEPTH CALLBACK PROCESSING FRAME")
+            
+            # CRITICAL: Always consider camera in motion to ensure updates
+            self.camera_motion_detected = True
             
             # Convert depth image to OpenCV format (float32 in meters)
             depth_image = self.cv_bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
@@ -229,13 +232,13 @@ class ZedOccupancyGridNode(Node):
                 
                 # Always publish when camera is moving, or at regular intervals when static
                 camera_pos = transform.transform.translation
-                if self.camera_motion_detected or current_time - self.last_publish_time >= self.publish_period:
-                    self.last_publish_time = current_time
-                    try:
-                        self.publish_occupancy_grid()
-                        self.get_logger().info(f"Published grid, camera pos: ({camera_pos.x:.2f}, {camera_pos.y:.2f}, {camera_pos.z:.2f})")
-                    except Exception as e:
-                        self.get_logger().error(f"Error publishing occupancy grid: {e}")
+                # MODIFIED: Always publish on every depth frame for instant updates
+                self.last_publish_time = current_time
+                try:
+                    self.publish_occupancy_grid()
+                    self.get_logger().info(f"Published grid, camera pos: ({camera_pos.x:.2f}, {camera_pos.y:.2f}, {camera_pos.z:.2f})")
+                except Exception as e:
+                    self.get_logger().error(f"Error publishing occupancy grid: {e}")
                 
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
                 self.get_logger().warning(f'TF error: {str(e)}')
@@ -252,10 +255,10 @@ class ZedOccupancyGridNode(Node):
                     self.get_logger().info(f'Got transform from odom to {self.camera_frame}, using as fallback')
                     self.update_grid_from_depth(depth_image, transform)
                     
-                    if current_time - self.last_publish_time >= self.publish_period:
-                        self.last_publish_time = current_time
-                        # Override map frame with odom for this publish
-                        self.publish_occupancy_grid(override_frame='odom')
+                    # MODIFIED: Always publish when we get a new depth frame
+                    self.last_publish_time = current_time
+                    # Override map frame with odom for this publish
+                    self.publish_occupancy_grid(override_frame='odom')
                 except Exception as e2:
                     self.get_logger().error(f'Fallback transform failed: {str(e2)}')
                 
@@ -390,7 +393,7 @@ class ZedOccupancyGridNode(Node):
         self.last_camera_quaternion = (qw, qx, qy, qz)
         
         # Camera has moved if either position or rotation changed significantly
-        camera_moved = position_changed or rotation_changed
+        camera_moved = True  # MODIFIED: Always consider the camera as moving
         
         # Log camera motion if state changed
         if camera_moved != self.camera_motion_detected:
@@ -545,12 +548,12 @@ class ZedOccupancyGridNode(Node):
             position_change = math.sqrt(dx*dx + dy*dy + dz*dz)
             
             # Just detect movement, but don't reset the map for persistence
-            if position_change > 0.001:  # Use a slightly higher threshold for pose
-                self.camera_motion_detected = True
-                self.get_logger().info(f"POSE_CALLBACK: Movement detected: {position_change:.6f}m")
-                # Save map on significant movement
-                if position_change > 0.1:  # Save map on larger movements
-                    self.save_map()
+            # MODIFIED: Always consider the camera as moving
+            self.camera_motion_detected = True
+            self.get_logger().info(f"POSE_CALLBACK: Movement detected: {position_change:.6f}m")
+            # Save map on significant movement
+            if position_change > 0.1:  # Save map on larger movements
+                self.save_map()
                 
         # Update last position
         self.last_camera_position = (pos.x, pos.y, pos.z)
@@ -560,7 +563,10 @@ class ZedOccupancyGridNode(Node):
         Update the log-odds grid using the depth image and camera transform.
         Uses probabilistic updates for better map quality.
         """
-        # Get motion information first so we can use position_change
+        # MODIFIED: Always consider camera moving to ensure updates
+        self.camera_motion_detected = True
+        
+        # Get motion information for debugging purposes
         is_moving, position_change = self.detect_camera_motion(transform)
         
         # For persistent mapping, we want to PRESERVE the grid and only update incrementally
@@ -589,268 +595,165 @@ class ZedOccupancyGridNode(Node):
         qz = transform.transform.rotation.z
         qw = transform.transform.rotation.w
         
-        # Compute the rotation matrix once
-        xx = qx * qx
-        xy = qx * qy
-        xz = qx * qz
-        xw = qx * qw
-        yy = qy * qy
-        yz = qy * qz
-        yw = qy * qw
-        zz = qz * qz
-        zw = qz * qw
+        # Convert quaternion to rotation matrix
+        # Formula from: https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation
+        rotation_matrix = np.zeros((3, 3), dtype=np.float32)
         
-        r00 = 1 - 2 * (yy + zz)
-        r01 = 2 * (xy - zw)
-        r02 = 2 * (xz + yw)
-        r10 = 2 * (xy + zw)
-        r11 = 1 - 2 * (xx + zz)
-        r12 = 2 * (yz - xw)
-        r20 = 2 * (xz - yw)
-        r21 = 2 * (yz + xw)
-        r22 = 1 - 2 * (xx + yy)
+        # First row
+        rotation_matrix[0, 0] = 1.0 - 2.0 * (qy * qy + qz * qz)
+        rotation_matrix[0, 1] = 2.0 * (qx * qy - qz * qw)
+        rotation_matrix[0, 2] = 2.0 * (qx * qz + qy * qw)
         
-        # ALWAYS force the camera to be considered in motion to ensure continuous updates
-        self.camera_motion_detected = True
-        # Use extremely aggressive filtering for immediate updates
-        self.current_alpha = 0.05  # Super aggressive value for immediate feedback
+        # Second row
+        rotation_matrix[1, 0] = 2.0 * (qx * qy + qz * qw)
+        rotation_matrix[1, 1] = 1.0 - 2.0 * (qx * qx + qz * qz)
+        rotation_matrix[1, 2] = 2.0 * (qy * qz - qx * qw)
         
-        # Force debug output
-        self.get_logger().error(f"!!!! UPDATING GRID - CAMERA AT ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f}) !!!!")
+        # Third row
+        rotation_matrix[2, 0] = 2.0 * (qx * qz - qy * qw)
+        rotation_matrix[2, 1] = 2.0 * (qy * qz + qx * qw)
+        rotation_matrix[2, 2] = 1.0 - 2.0 * (qx * qx + qy * qy)
         
-        # This is just for debug info
-        is_moving, position_change = self.detect_camera_motion(transform)
+        # Sample rays through the depth image - process a subsample for efficiency
+        # For each pixel, convert to 3D point and update log-odds grid
+        step = 4  # Process every 4th pixel for efficiency
         
-        # Debug - explicitly log current camera position every time we process data
-        self.get_logger().info(f"CAMERA MONITOR - Current position: ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f})")
-        
-        # Choose sampling density - always use fine sampling for better detail
-        stride_y = 6  # Fine sampling for better details
-        stride_x = 6  # Fine sampling for better details
-        
-        # Lock for thread safety
-        with self.grid_lock:
-            # Create a temporary grid for this update
-            current_update = np.full((self.grid_rows, self.grid_cols), self.LOG_ODDS_PRIOR, dtype=np.float32)
-            
-            # Process each pixel in the depth image with adaptive stride
-            for y in range(0, height, stride_y):
-                for x in range(0, width, stride_x):
-                    depth = depth_image[y, x]
+        with self.grid_lock:  # Thread safety
+            for v in range(0, height, step):
+                for u in range(0, width, step):
+                    # Get depth value
+                    depth = depth_image[v, u]
                     
-                    # Skip invalid or out-of-range depths
+                    # Skip invalid depth values
                     if not np.isfinite(depth) or depth < self.min_depth or depth > self.max_depth:
                         continue
                     
-                    # Calculate 3D position in camera frame
-                    angle_h = (x / width - 0.5) * fov_horizontal
-                    angle_v = (y / height - 0.5) * fov_vertical
+                    # Calculate normalized image coordinates
+                    # Map from pixel coordinates to normalized [-1, 1] image coordinates
+                    normalized_u = (2.0 * u / width - 1.0)
+                    normalized_v = (2.0 * v / height - 1.0)
                     
-                    # Convert to 3D point in camera frame
-                    point_x = depth * np.cos(angle_v) * np.cos(angle_h)
-                    point_y = depth * np.cos(angle_v) * np.sin(angle_h)
-                    point_z = depth * np.sin(angle_v)
+                    # Calculate 3D vector from camera using field of view
+                    # For a pinhole camera model:
+                    # tan(fov_horizontal/2) = max_u / z
+                    # tan(fov_vertical/2) = max_v / z
+                    ray_x = normalized_u * np.tan(fov_horizontal / 2.0) * depth
+                    ray_y = normalized_v * np.tan(fov_vertical / 2.0) * depth
+                    ray_z = depth
                     
-                    # Apply rotation matrix to point
-                    rotated_x = r00 * point_x + r01 * point_y + r02 * point_z
-                    rotated_y = r10 * point_x + r11 * point_y + r12 * point_z
-                    rotated_z = r20 * point_x + r21 * point_y + r22 * point_z
+                    # Transform ray from camera to world coordinates
+                    world_x = (rotation_matrix[0, 0] * ray_x +
+                              rotation_matrix[0, 1] * ray_y +
+                              rotation_matrix[0, 2] * ray_z) + camera_x
                     
-                    # Apply translation
-                    map_x = rotated_x + camera_x
-                    map_y = rotated_y + camera_y
-                    map_z = rotated_z + camera_z  # We'll need this for 3D mapping if needed
+                    world_y = (rotation_matrix[1, 0] * ray_x +
+                              rotation_matrix[1, 1] * ray_y +
+                              rotation_matrix[1, 2] * ray_z) + camera_y
                     
-                    # Convert to grid cell coordinates
-                    grid_x = int((map_x - self.grid_origin_x) / self.resolution)
-                    grid_y = int((map_y - self.grid_origin_y) / self.resolution)
+                    world_z = (rotation_matrix[2, 0] * ray_x +
+                              rotation_matrix[2, 1] * ray_y +
+                              rotation_matrix[2, 2] * ray_z) + camera_z
                     
-                    # Check if inside grid bounds
-                    if 0 <= grid_x < self.grid_cols and 0 <= grid_y < self.grid_rows:
-                        # Increase observation count for the cell
-                        self.observation_count_grid[grid_y, grid_x] += 1
-                        
-                        # Update the occupied cell with positive log-odds
-                        current_update[grid_y, grid_x] = self.LOG_ODDS_OCCUPIED
-                        
-                        # Also store the height for potential 3D mapping
-                        if self.cell_height_grid[grid_y, grid_x] == 0:
-                            self.cell_height_grid[grid_y, grid_x] = map_z
-                        else:
-                            # Exponential weighted average for height
-                            alpha = 0.8
-                            self.cell_height_grid[grid_y, grid_x] = alpha * self.cell_height_grid[grid_y, grid_x] + (1-alpha) * map_z
+                    # Skip points that are too far from camera
+                    if np.sqrt((world_x - camera_x)**2 + (world_y - camera_y)**2) > self.max_ray_length:
+                        continue
                     
-                        # Mark cells along the ray as free using Bresenham's line algorithm
-                        self.mark_ray_as_free_3d(camera_x, camera_y, map_x, map_y, current_update)
+                    # Convert world coordinates to grid cell coordinates
+                    grid_x = int((world_x - self.grid_origin_x) / self.resolution)
+                    grid_y = int((world_y - self.grid_origin_y) / self.resolution)
+                    
+                    # Skip if out of grid bounds
+                    if (grid_x < 0 or grid_x >= self.grid_cols or
+                        grid_y < 0 or grid_y >= self.grid_rows):
+                        continue
+                    
+                    # Bresenham ray-tracing from camera to point
+                    # This marks cells along the ray as free, and the endpoint as occupied
+                    self.raytrace_bresenham(
+                        int((camera_x - self.grid_origin_x) / self.resolution),
+                        int((camera_y - self.grid_origin_y) / self.resolution),
+                        grid_x, grid_y, world_z)
+    
+    def raytrace_bresenham(self, x0, y0, x1, y1, point_height):
+        """
+        Bresenham's line algorithm for ray tracing through the grid
+        Marks cells as free along the ray, and the endpoint as occupied
+        """
+        # Ensure coordinates are within grid bounds
+        x0 = max(0, min(x0, self.grid_cols - 1))
+        y0 = max(0, min(y0, self.grid_rows - 1))
+        x1 = max(0, min(x1, self.grid_cols - 1))
+        y1 = max(0, min(y1, self.grid_rows - 1))
+        
+        # Calculate differences and steps
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        
+        # Variables to track progress along the ray
+        traveled = 0
+        total_distance = np.sqrt(dx**2 + dy**2)
+        
+        # Ray tracing
+        x, y = x0, y0
+        while x != x1 or y != y1:
+            # Skip updating the cell where the camera is located
+            if x != x0 or y != y0:
+                # Update log-odds for free cell (cells along the ray)
+                # We use temporal filtering to slowly update log-odds
+                if self.temporal_filtering:
+                    alpha = self.current_alpha
+                    self.log_odds_grid[y, x] = (1 - alpha) * self.log_odds_grid[y, x] + alpha * self.LOG_ODDS_FREE
+                else:
+                    self.log_odds_grid[y, x] += self.LOG_ODDS_FREE
+                
+                # Ensure log-odds value stays within bounds
+                self.log_odds_grid[y, x] = max(self.LOG_ODDS_MIN, min(self.LOG_ODDS_MAX, self.log_odds_grid[y, x]))
+                
+                # Increment observation count
+                self.observation_count_grid[y, x] += 1
             
-            # Integrate the current update with the main grid
-            # Use temporal filtering to reduce noise if enabled
+            # Bresenham algorithm step
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+                
+            # Break if we've gone too far
+            traveled += 1
+            if traveled > total_distance:
+                break
+        
+        # Mark the endpoint as occupied if it's valid and not the camera position
+        if (x1 != x0 or y1 != y0) and x1 >= 0 and x1 < self.grid_cols and y1 >= 0 and y1 < self.grid_rows:
+            # Update log-odds for occupied cell (endpoint)
             if self.temporal_filtering:
-                # Apply weighted average based on camera motion
-                # Moving camera = less temporal filtering (lower alpha) for faster updates
-                # Static camera = more temporal filtering (higher alpha) for stability
-                mask = (current_update != self.LOG_ODDS_PRIOR)  # Only update cells we observed
-                self.log_odds_grid[mask] = self.current_alpha * self.log_odds_grid[mask] + (1-self.current_alpha) * current_update[mask]
-                
-            # When camera is moving, give extra weight to new observations and reduce weight of old observations
-            # We're always considering the camera to be moving now, so this code will always run
-            # Debug logs to track exact motion values
-            self.get_logger().info(f"MOTION DEBUG: position_change={position_change:.6f}, threshold={self.position_change_threshold}")
-            self.get_logger().info(f"MOTION DEBUG: camera at ({camera_x:.3f}, {camera_y:.3f}, {camera_z:.3f})")
-            
-            if position_change > self.position_change_threshold * 5:  # 5x the threshold for significant movement
-                # For persistent mapping, we DON'T reset the grid on significant movement
-                # Instead, we integrate new data more aggressively
-                self.get_logger().info("*** SIGNIFICANT MOVEMENT DETECTED - INTEGRATING NEW DATA ***")
-                self.get_logger().info(f"*** Movement amount: {position_change:.6f} meters ***")
-                self.get_logger().info(f"*** Position: {camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f} ***")
-                
-                # More strongly update occupied cells from current observation
-                occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
-                num_occupied = np.sum(occupied_mask)
-                
-                if num_occupied > 0:
-                    # Update with higher confidence but don't overwrite with max weight
-                    # to allow multiple observations to refine over time
-                    self.log_odds_grid[occupied_mask] = np.maximum(
-                        self.log_odds_grid[occupied_mask] + 2.0 * self.LOG_ODDS_OCCUPIED,
-                        self.LOG_ODDS_MAX * 0.8  # Cap at 80% of max to allow refinement
-                    )
-                
-                # Update free cells from current observation
-                free_mask = (current_update == self.LOG_ODDS_FREE)
-                num_free = np.sum(free_mask)
-                
-                if num_free > 0:
-                    # Use normal free update - but only update cells that aren't strongly occupied
-                    not_occupied_mask = self.log_odds_grid < self.OCCUPIED_THRESHOLD
-                    update_mask = free_mask & not_occupied_mask
-                    self.log_odds_grid[update_mask] += self.LOG_ODDS_FREE
-                
-                self.get_logger().info(f"*** Added new data: {num_occupied} occupied cells, {num_free} free cells ***")
-                
-                # Save map on significant movement
-                self.save_map()
-                
-                # Force republish
-                self.last_publish_time = 0
+                alpha = self.current_alpha
+                self.log_odds_grid[y1, x1] = (1 - alpha) * self.log_odds_grid[y1, x1] + alpha * self.LOG_ODDS_OCCUPIED
             else:
-                # Eliminate duplicate update code
-                
-                # We need to ensure updates are happening consistently
-                # Apply more aggressive updates to ensure map builds correctly
-                
-                # Boost occupied cells more strongly
-                occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
-                if np.any(occupied_mask):
-                    # Strongly boost occupied cells to appear immediately
-                    self.log_odds_grid[occupied_mask] = self.LOG_ODDS_MAX  # Force to maximum value
-                    num_occupied = np.sum(occupied_mask)
-                    self.get_logger().info(f"Updated {num_occupied} occupied cells")
-                
-                # Update free cells more consistently
-                free_mask = (current_update == self.LOG_ODDS_FREE)
-                if np.any(free_mask):
-                    # For already occupied cells (high log-odds), decay them slowly
-                    # For other cells, make them more definitively free
-                    high_odds_mask = (self.log_odds_grid > self.OCCUPIED_THRESHOLD) & free_mask
-                    low_odds_mask = ~high_odds_mask & free_mask
-                    
-                    if np.any(high_odds_mask):
-                        # Gentle decay for contradictions
-                        self.log_odds_grid[high_odds_mask] *= 0.9  # Gentle decay
-                        self.get_logger().info(f"Gently decayed {np.sum(high_odds_mask)} contradicting cells")
-                        
-                    if np.any(low_odds_mask):
-                        # Stronger free updates for non-contradictions
-                        self.log_odds_grid[low_odds_mask] += 2.0 * self.LOG_ODDS_FREE
-                        self.get_logger().info(f"Updated {np.sum(low_odds_mask)} free cells")
+                self.log_odds_grid[y1, x1] += self.LOG_ODDS_OCCUPIED
             
-            # Clamp log-odds values to prevent numerical issues
-            self.log_odds_grid = np.clip(self.log_odds_grid, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX)
-
+            # Ensure log-odds value stays within bounds
+            self.log_odds_grid[y1, x1] = max(self.LOG_ODDS_MIN, min(self.LOG_ODDS_MAX, self.log_odds_grid[y1, x1]))
+            
+            # Update height value for the cell (for visualization)
+            if self.cell_height_grid[y1, x1] == 0:
+                self.cell_height_grid[y1, x1] = point_height
+            else:
+                # Average with previous height
+                self.cell_height_grid[y1, x1] = 0.7 * self.cell_height_grid[y1, x1] + 0.3 * point_height
+            
+            # Increment observation count
+            self.observation_count_grid[y1, x1] += 1
+    
     def check_tf_callback(self):
-        """
-        Regularly check TF to detect camera movement independently
-        This ensures we catch all camera movements even if pose callbacks are missing
-        """
+        """Check transforms periodically to detect camera movement"""
         try:
-            # Try to get the current camera position from TF
-            transform = self.tf_buffer.lookup_transform(
-                'map',  # Try map first
-                self.camera_frame,
-                rclpy.time.Time(),
-                rclpy.duration.Duration(seconds=0.1)
-            )
-            
-            # Force camera to be considered moving for immediate updates
-            self.camera_motion_detected = True
-            
-            # Get the position for logging
-            camera_x = transform.transform.translation.x
-            camera_y = transform.transform.translation.y
-            camera_z = transform.transform.translation.z
-            
-            # Log position for debugging
-            self.get_logger().warn(f"TF CHECK - Camera at ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f})")
-            
-            # Process a depth image if we have one
-            self.force_depth_update()
-            
-        except Exception as e:
-            # Try odom frame as fallback
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    'odom',
-                    self.camera_frame,
-                    rclpy.time.Time(),
-                    rclpy.duration.Duration(seconds=0.1)
-                )
-                
-                # Still force camera to be moving
-                self.camera_motion_detected = True
-                
-                # Get position for logging
-                camera_x = transform.transform.translation.x
-                camera_y = transform.transform.translation.y
-                camera_z = transform.transform.translation.z
-                
-                # Log as warning for visibility
-                self.get_logger().warn(f"TF CHECK (odom) - Camera at ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f})")
-                
-                # Try to process a depth image
-                self.force_depth_update()
-                
-            except Exception as e2:
-                # Just log the error
-                pass
-    
-    def force_update_callback(self):
-        """
-        Force periodic grid updates regardless of camera movement
-        Ensures the map is constantly updated even when the camera appears static
-        """
-        # Force motion flag to ensure grid updates
-        self.camera_motion_detected = True
-        
-        # Log this forced update
-        self.get_logger().warn("FORCED UPDATE - Ensuring continuous map building")
-        
-        # Force publishing the grid
-        if np.any(self.observation_count_grid > 0):
-            self.publish_occupancy_grid()
-            
-        # Try to force a depth update
-        self.force_depth_update()
-    
-    def force_depth_update(self):
-        """
-        Attempt to trigger a depth update using the last known transform
-        This helps ensure continuous map updates
-        """
-        try:
-            # Try to get a transform to use for updating
             transform = self.tf_buffer.lookup_transform(
                 self.map_frame,
                 self.camera_frame,
@@ -858,154 +761,70 @@ class ZedOccupancyGridNode(Node):
                 rclpy.duration.Duration(seconds=0.1)
             )
             
-            # Only process if we got a valid transform
-            if hasattr(transform, 'transform'):
-                # Log that we're forcing an update
-                camera_x = transform.transform.translation.x
-                camera_y = transform.transform.translation.y
-                camera_z = transform.transform.translation.z
-                
-                self.get_logger().warn(f"FORCING DEPTH UPDATE - Camera at ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f})")
-                
-                # Force camera to be considered moving
-                self.camera_motion_detected = True
-                
-                # Force a publish
-                self.publish_occupancy_grid()
-        except Exception as e:
-            # Just log at debug level since this is a background operation
-            self.get_logger().debug(f"Could not force depth update: {e}")
+            # Check for camera motion
+            is_moving, position_change = self.detect_camera_motion(transform)
             
+            # Log the camera position
+            camera_pos = transform.transform.translation
+            self.get_logger().debug(f"TF Monitor: Camera at ({camera_pos.x:.2f}, {camera_pos.y:.2f}, {camera_pos.z:.2f})")
+            
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().debug(f'TF Monitor: Error getting transform: {str(e)}')
+    
+    def force_update_callback(self):
+        """Force grid updates periodically even without new depth data"""
+        # Only force updates if we've already built a map
+        if np.any(self.observation_count_grid > 0):
+            self.get_logger().debug("Forcing grid update")
+            self.publish_occupancy_grid()
+    
     def camera_monitor_callback(self):
-        """Timer callback that regularly checks and logs camera position regardless of movement"""
-        try:
-            # Try to get transform from camera to map or odom
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    self.map_frame,
-                    self.camera_frame,
-                    rclpy.time.Time(),
-                    rclpy.duration.Duration(seconds=0.1)  # Short timeout
-                )
-                # Use map frame
-                frame = self.map_frame
-            except Exception:
-                # Fall back to odom if map isn't available
-                transform = self.tf_buffer.lookup_transform(
-                    'odom',
-                    self.camera_frame,
-                    rclpy.time.Time(),
-                    rclpy.duration.Duration(seconds=0.1)
-                )
-                frame = 'odom'
+        """Log camera position and status periodically"""
+        from std_msgs.msg import String
+        
+        # Check if we have position info
+        if self.last_camera_position is not None:
+            status = "MOVING" if self.camera_motion_detected else "STATIC"
+            position_str = (f"Camera {status}: ({self.last_camera_position[0]:.3f}, "
+                           f"{self.last_camera_position[1]:.3f}, {self.last_camera_position[2]:.3f})")
             
-            # Extract camera position
-            pos = transform.transform.translation
-            
-            # Always log camera position, even when not moving
-            from std_msgs.msg import String
-            position_str = f"TIMER_MONITOR: Camera at ({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f}) in {frame} frame"
-            self.get_logger().info(position_str)
-            
-            # Publish to debug topic for external monitoring
+            # Publish debug info
             debug_msg = String()
             debug_msg.data = position_str
             self.debug_pub.publish(debug_msg)
-            
-            # Don't reset grid from the timer - just log and monitor
-            # Force a publish only if we have data
-            if np.any(self.observation_count_grid > 0):
-                self.publish_occupancy_grid(override_frame=frame)
-            
-        except Exception as e:
-            self.get_logger().error(f"Error in camera monitor timer: {e}")
-    
-    def mark_cells_in_view(self, start_grid_x, start_grid_y, end_grid_x, end_grid_y, in_view_mask):
-        """
-        Marks cells along a ray as being in view using Bresenham's line algorithm.
-        Similar to mark_ray_as_free_3d but just marks cells as visible without changing log-odds.
-        Used to track which cells are currently in the camera's field of view.
-        """
-        # Bresenham's line algorithm
-        dx = abs(end_grid_x - start_grid_x)
-        dy = abs(end_grid_y - start_grid_y)
-        sx = 1 if start_grid_x < end_grid_x else -1
-        sy = 1 if start_grid_y < end_grid_y else -1
-        err = dx - dy
-        
-        x, y = start_grid_x, start_grid_y
-        
-        # For each point along the line including the endpoint
-        while True:
-            if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
-                # Mark as in view
-                in_view_mask[y, x] = True
-            
-            # Check if we've reached the endpoint
-            if x == end_grid_x and y == end_grid_y:
-                break
-                
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
-    
-    def mark_ray_as_free_3d(self, start_x, start_y, end_x, end_y, current_update):
-        """
-        Marks cells along a ray from start to end as free using 3D Bresenham's algorithm.
-        Updates the current_update array with negative log-odds for free cells.
-        """
-        # Limit the ray length to avoid marking too much as free
-        dx = end_x - start_x
-        dy = end_y - start_y
-        dist = math.sqrt(dx**2 + dy**2)
-        
-        if dist > self.max_ray_length:
-            # Scale the end point to max_ray_length
-            factor = self.max_ray_length / dist
-            end_x = start_x + dx * factor
-            end_y = start_y + dy * factor
-        
-        # Convert to grid coordinates
-        start_grid_x = int((start_x - self.grid_origin_x) / self.resolution)
-        start_grid_y = int((start_y - self.grid_origin_y) / self.resolution)
-        end_grid_x = int((end_x - self.grid_origin_x) / self.resolution)
-        end_grid_y = int((end_y - self.grid_origin_y) / self.resolution)
-        
-        # Bresenham's line algorithm
-        dx = abs(end_grid_x - start_grid_x)
-        dy = abs(end_grid_y - start_grid_y)
-        sx = 1 if start_grid_x < end_grid_x else -1
-        sy = 1 if start_grid_y < end_grid_y else -1
-        err = dx - dy
-        
-        x, y = start_grid_x, start_grid_y
-        
-        # For each point along the line except the endpoint (which might be occupied)
-        while (x != end_grid_x or y != end_grid_y):
-            if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
-                # Mark as free using negative log-odds
-                current_update[y, x] = self.LOG_ODDS_FREE
-                # Also increment observation count
-                self.observation_count_grid[y, x] += 1
-            
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
 
 
 def main(args=None):
+    """Main entry point for the ZED Occupancy Grid Node"""
+    # Initialize ROS
     rclpy.init(args=args)
+    
+    # Create the node
     node = ZedOccupancyGridNode()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    
+    # Set up multi-threaded executor for better performance with multiple callbacks
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
+    
+    try:
+        # Spin the node
+        node.get_logger().info('ZED Occupancy Grid Node is spinning...')
+        executor.spin()
+    except KeyboardInterrupt:
+        node.get_logger().info('Keyboard interrupt, shutting down')
+    except Exception as e:
+        node.get_logger().error(f'Unexpected error: {str(e)}')
+    finally:
+        # Clean shutdown - save map before exit
+        try:
+            node.get_logger().info('Saving final map before shutdown...')
+            node.save_map()
+        except Exception as e:
+            node.get_logger().error(f'Error saving final map: {str(e)}')
+            
+        # Destroy node and shut down ROS
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
