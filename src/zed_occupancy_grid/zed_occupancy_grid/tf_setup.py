@@ -2,7 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, PoseStamped
 from tf2_ros import StaticTransformBroadcaster
 
 
@@ -48,12 +48,36 @@ class StaticTFPublisher(Node):
         self.static_broadcaster.sendTransform(tf_transforms)
         self.get_logger().info('Published static transforms for occupancy grid')
         
-        # The critical map-to-odom transform needs to be published dynamically
-        # This will be updated at regular intervals to ensure the TF tree is connected
-        self.map_odom_timer = self.create_timer(0.1, self.publish_map_to_odom)
-        
         # Initialize last known position from camera to map
         self.last_odom_pose = None
+        self.camera_moved = False
+        
+        # Subscribe to ZED camera position updates for immediate transform updates
+        self.pose_subscriber = self.create_subscription(
+            PoseStamped, '/zed/zed_node/pose', self.camera_pose_callback, 1)
+        self.get_logger().info('Subscribed to ZED camera pose topic for real-time updates')
+        
+        # The map-to-odom transform will be published both on camera movement and as a backup timer
+        # This timer is a fallback to ensure we always have a transform even if camera pose isn't received
+        self.map_odom_timer = self.create_timer(0.1, self.publish_map_to_odom)
+        
+    def camera_pose_callback(self, pose_msg):
+        """Process camera pose updates and immediately publish transforms"""
+        try:
+            # Extract position from the camera pose
+            pos = pose_msg.pose.position
+            
+            # Log position for debugging
+            self.get_logger().debug(f"Camera position update: ({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f})")
+            
+            # Immediately publish the transform on camera movement
+            self.publish_map_to_odom()
+            
+            # Mark that camera has moved
+            self.camera_moved = True
+            
+        except Exception as e:
+            self.get_logger().error(f"Error in camera pose callback: {str(e)}")
 
     def publish_map_to_odom(self):
         """Publish the transform from map to odom frame"""

@@ -197,6 +197,9 @@ class ZedOccupancyGridNode(Node):
             # Convert depth image to OpenCV format (float32 in meters)
             depth_image = self.cv_bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
             
+            # Store the depth image for use in pose callbacks (allows immediate grid updates)
+            self.latest_depth_image = depth_image
+            
             # Get depth image stats for debugging (reduce verbosity)
             valid_depths = depth_image[np.isfinite(depth_image)]
             if valid_depths.size > 0:
@@ -608,36 +611,62 @@ class ZedOccupancyGridNode(Node):
         """
         Direct callback for camera pose messages
         This ensures we detect camera movement even when transform detection fails
+        ENHANCED: Immediately updates and publishes grid on camera movement
         """
         from std_msgs.msg import String
         
         # Extract position from the pose message
         pos = pose_msg.pose.position
         
-        # Log the position to both ROS log and a debug topic
-        position_str = f"POSE_MONITOR: Camera at ({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f})"
-        self.get_logger().info(position_str)
-        
-        # Publish to debug topic for external monitoring
-        debug_msg = String()
-        debug_msg.data = position_str
-        self.debug_pub.publish(debug_msg)
-        
         # Calculate position change if we have a previous position
+        position_change = 0.0
         if self.last_camera_position is not None:
             dx = pos.x - self.last_camera_position[0]
             dy = pos.y - self.last_camera_position[1]
             dz = pos.z - self.last_camera_position[2]
             position_change = math.sqrt(dx*dx + dy*dy + dz*dz)
             
-            # Just detect movement, but don't reset the map for persistence
-            # MODIFIED: Always consider the camera as moving
-            self.camera_motion_detected = True
-            self.get_logger().info(f"POSE_CALLBACK: Movement detected: {position_change:.6f}m")
+        # Log the position to both ROS log and a debug topic
+        position_str = f"POSE_MONITOR: Camera at ({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f})"
+        self.get_logger().info(position_str)
+        debug_msg = String()
+        debug_msg.data = position_str
+        self.debug_pub.publish(debug_msg)
+        
+        # Update camera state and mark as moving
+        self.camera_motion_detected = True
+        self.get_logger().info(f"POSE_CALLBACK: Movement detected: {position_change:.6f}m - IMMEDIATE UPDATE")
+        
+        # Immediately attempt to update the occupancy grid based on this new position
+        try:
+            # Get transform from map to camera
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.camera_frame,
+                rclpy.time.Time(),
+                rclpy.duration.Duration(seconds=0.1)  # Short timeout for real-time response
+            )
+            
+            # IMMEDIATE UPDATE: Process existing depth data with new transform
+            # This allows grid updates even without new depth frames
+            with self.grid_lock:
+                # For significant movements (> 1cm), force full update of the grid
+                if position_change > 0.01:
+                    # Get most recent depth image if we have it
+                    if hasattr(self, 'latest_depth_image') and self.latest_depth_image is not None:
+                        self.get_logger().warn("IMMEDIATE grid update triggered by camera movement")
+                        self.update_grid_from_depth(self.latest_depth_image, transform)
+                        self.publish_occupancy_grid()
+            
             # Save map on significant movement
             if position_change > 0.1:  # Save map on larger movements
                 self.save_map()
                 
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warning(f"Cannot update grid immediately: {str(e)}")
+        except Exception as e:
+            self.get_logger().error(f"Error in immediate grid update: {str(e)}")
+        
         # Update last position
         self.last_camera_position = (pos.x, pos.y, pos.z)
         
