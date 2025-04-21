@@ -643,6 +643,9 @@ class ZedOccupancyGridNode(Node):
         Update the log-odds grid using the depth image and camera transform.
         Uses probabilistic updates for better map quality.
         """
+        # DEBUG: Add logging to track function entry
+        self.get_logger().info("Entering update_grid_from_depth")
+        
         # MODIFIED: Always consider camera moving to ensure updates
         self.camera_motion_detected = True
         
@@ -694,62 +697,29 @@ class ZedOccupancyGridNode(Node):
         rotation_matrix[2, 1] = 2.0 * (qy * qz + qx * qw)
         rotation_matrix[2, 2] = 1.0 - 2.0 * (qx * qx + qy * qy)
         
-        # EXTREME PERFORMANCE OPTIMIZATION: Use adaptive sampling to maintain map quality
-        # Process fewer points for far-away regions (which need less detail)
-        # But maintain higher resolution for nearby objects (important for collision avoidance)
-        base_step = 16  # Base sampling rate
+        # SIMPLIFIED PERFORMANCE OPTIMIZATION to ensure map updates properly
+        # Use a fixed step size that's aggressive but reliable
+        step = 12  # Process 1/12 of pixels for a better balance of speed vs quality
         
-        # Pre-allocate arrays for vectorized operations (huge performance gain)
-        camera_grid_x = int((camera_x - self.grid_origin_x) / self.resolution)
-        camera_grid_y = int((camera_y - self.grid_origin_y) / self.resolution)
-
-        # CRITICAL PERFORMANCE OPTIMIZATION:
-        # 1. Only process the center portion of the image (70% of width/height) 
-        # 2. This is where most important data is while maintaining map quality
-        height_start = int(height * 0.15)
-        height_end = int(height * 0.85)
-        width_start = int(width * 0.15)
-        width_end = int(width * 0.85)
-        
-        # Implement multi-threading for massive performance gain (process depth data in parallel)
-        # Divide image into sections and process them concurrently
-        from concurrent.futures import ThreadPoolExecutor
-        import numpy as np
-        
-        # Calculate camera position in grid coordinates once (reuse for all rays)
+        # Precompute camera position in grid coordinates
         camera_grid_x = int((camera_x - self.grid_origin_x) / self.resolution)
         camera_grid_y = int((camera_y - self.grid_origin_y) / self.resolution)
         
-        # ULTRA PERFORMANCE OPTIMIZATION: Only process a strategic subset of the image
-        # Process more points in center/near areas (important for navigation), fewer in periphery/far areas
-        height_start = int(height * 0.15)
-        height_end = int(height * 0.85)
-        width_start = int(width * 0.15)
-        width_end = int(width * 0.85)
-                
-        # Precompute constants for ray calculations (avoid repeated calculations)
+        # Precompute constants to avoid repeated calculations
         tan_fov_h = np.tan(fov_horizontal / 2.0)
         tan_fov_v = np.tan(fov_vertical / 2.0)
         
-        # Define a function to process a chunk of the image in parallel
-        def process_image_chunk(v_range):
-            rays_to_process = []
+        # Use a simpler direct approach to ensure reliability
+        with self.grid_lock:  # Thread safety
+            ray_count = 0  # Track rays for debugging
             
-            # First pass: collect valid rays (avoid lock contention)
-            for v in v_range:
-                # Adaptive sampling - process every pixel in center, sparser on edges
-                is_center_v = (v > height_start and v < height_end)
-                
-                for u in range(width_start, width_end, 8 if is_center_v else 24):
-                    # Adaptive sampling - more dense in center of image
-                    is_center_u = (u > width_start and u < width_end)
-                    if not is_center_u and not is_center_v and (u % 24 != 0 or v % 24 != 0):
-                        continue
-                        
+            # Process image in a simple loop approach
+            for v in range(0, height, step):
+                for u in range(0, width, step):
                     # Get depth value
                     depth = depth_image[v, u]
                     
-                    # Skip invalid depth values (fast filter)
+                    # Skip invalid depth values
                     if not np.isfinite(depth) or depth < self.min_depth or depth > self.max_depth:
                         continue
                     
@@ -757,45 +727,50 @@ class ZedOccupancyGridNode(Node):
                     normalized_u = (2.0 * u / width - 1.0)
                     normalized_v = (2.0 * v / height - 1.0)
                     
-                    # Calculate 3D vector from camera
+                    # Calculate 3D vector from camera using field of view
                     ray_x = normalized_u * tan_fov_h * depth
                     ray_y = normalized_v * tan_fov_v * depth
                     ray_z = depth
                     
-                    # Transform ray to world coordinates (vectorized)
-                    world_x = (rotation_matrix[0, 0] * ray_x + rotation_matrix[0, 1] * ray_y + rotation_matrix[0, 2] * ray_z) + camera_x
-                    world_y = (rotation_matrix[1, 0] * ray_x + rotation_matrix[1, 1] * ray_y + rotation_matrix[1, 2] * ray_z) + camera_y
-                    world_z = (rotation_matrix[2, 0] * ray_x + rotation_matrix[2, 1] * ray_y + rotation_matrix[2, 2] * ray_z) + camera_z
+                    # Transform ray from camera to world coordinates
+                    world_x = (rotation_matrix[0, 0] * ray_x +
+                              rotation_matrix[0, 1] * ray_y +
+                              rotation_matrix[0, 2] * ray_z) + camera_x
                     
-                    # Skip points that are too far from camera (fast reject)
+                    world_y = (rotation_matrix[1, 0] * ray_x +
+                              rotation_matrix[1, 1] * ray_y +
+                              rotation_matrix[1, 2] * ray_z) + camera_y
+                    
+                    world_z = (rotation_matrix[2, 0] * ray_x +
+                              rotation_matrix[2, 1] * ray_y +
+                              rotation_matrix[2, 2] * ray_z) + camera_z
+                    
+                    # Skip points that are too far from camera
                     if np.sqrt((world_x - camera_x)**2 + (world_y - camera_y)**2) > self.max_ray_length:
                         continue
                     
-                    # Convert world coordinates to grid coordinates
+                    # Convert world coordinates to grid cell coordinates
                     grid_x = int((world_x - self.grid_origin_x) / self.resolution)
                     grid_y = int((world_y - self.grid_origin_y) / self.resolution)
                     
                     # Skip if out of grid bounds
-                    if (grid_x < 0 or grid_x >= self.grid_cols or grid_y < 0 or grid_y >= self.grid_rows):
+                    if (grid_x < 0 or grid_x >= self.grid_cols or
+                        grid_y < 0 or grid_y >= self.grid_rows):
                         continue
                     
-                    # Collect valid rays for batch processing
-                    rays_to_process.append((grid_x, grid_y, world_z))
+                    # Bresenham ray-tracing from camera to point
+                    # This marks cells along the ray as free, and the endpoint as occupied
+                    self.raytrace_bresenham(
+                        camera_grid_x, camera_grid_y,
+                        grid_x, grid_y, world_z)
+                    
+                    ray_count += 1
             
-            # Second pass: process all collected rays at once (with lock held only once)
-            with self.grid_lock:
-                for grid_x, grid_y, world_z in rays_to_process:
-                    # Use optimized Bresenham
-                    self.raytrace_bresenham(camera_grid_x, camera_grid_y, grid_x, grid_y, world_z)
-        
-        # Divide the image into vertical slices for parallel processing
-        chunk_size = (height_end - height_start) // 4  # Process in 4 parallel chunks
-        v_ranges = [range(v, min(v+chunk_size, height_end), base_step) 
-                    for v in range(height_start, height_end, chunk_size)]
-        
-        # Process chunks in parallel
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            executor.map(process_image_chunk, v_ranges)
+            # DEBUG: Log how many rays were processed only if significant
+            if ray_count > 0:
+                self.get_logger().info(f"Processed {ray_count} rays in update_grid_from_depth")
+            else:
+                self.get_logger().warn("No valid rays processed! Check depth data and transforms.")
     
     def raytrace_bresenham(self, x0, y0, x1, y1, point_height):
         """
