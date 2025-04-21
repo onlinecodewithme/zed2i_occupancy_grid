@@ -136,22 +136,46 @@ class ZedOccupancyGridNode(Node):
             Image, self.depth_topic, self.depth_callback, qos_profile_sub)
             
         # Add MULTIPLE special subscribers to force-track camera position
-        from geometry_msgs.msg import PoseStamped, TransformStamped
+        from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
+        from sensor_msgs.msg import Imu
+        from nav_msgs.msg import Odometry
         
-        # Subscribe to ALL possible pose topics for maximum redundancy
-        # Try different topic names to ensure we catch camera movement
+        # !!! EMERGENCY FIX: Try ALL possible movement-related topics at highest QoS
+        # Subscribe with ABSOLUTE HIGHEST PRIORITY to ALL possible movement topics
         self.pose_subscriber = self.create_subscription(
-            PoseStamped, '/zed/zed_node/pose', self.pose_callback, 1)  # Higher priority (QoS=1)
-        
-        # Add redundant pose subscriptions with alternate topic names
+            PoseStamped, '/zed/zed_node/pose', self.pose_callback, 1)
+            
         self.pose_subscriber2 = self.create_subscription(
-            PoseStamped, '/zed/pose', self.pose_callback, 1)  # Alternative topic name
+            PoseStamped, '/zed/pose', self.pose_callback, 1)
             
         self.pose_subscriber3 = self.create_subscription(
-            PoseStamped, '/zed2i/zed_node/pose', self.pose_callback, 1)  # Alternative camera name
+            PoseStamped, '/zed2i/zed_node/pose', self.pose_callback, 1)
+            
+        # Add odometry subscriptions which may be more reliable
+        self.odom_subscriber = self.create_subscription(
+            Odometry, '/zed/zed_node/odom', self.odom_callback, 1)
+            
+        self.odom_subscriber2 = self.create_subscription(
+            Odometry, '/zed/odom', self.odom_callback, 1)
+            
+        # Add IMU subscriptions to detect movement from acceleration data
+        self.imu_subscriber = self.create_subscription(
+            Imu, '/zed/zed_node/imu/data', self.imu_callback, 1)
+            
+        # Add velocity subscriptions to detect commanded movement
+        self.cmd_vel_subscriber = self.create_subscription(
+            Twist, '/cmd_vel', self.twist_callback, 1)
+            
+        # Try one more subscriber with raw camera name
+        self.pose_subscriber4 = self.create_subscription(
+            PoseStamped, '/zed_node/pose', self.pose_callback, 1)
+            
+        # Create a FORCED camera-moving timer that always assumes camera is moving
+        # This ensures we get updates even if movement detection fails
+        self.forced_motion_timer = self.create_timer(0.25, self.forced_movement_callback)
             
         # Add debug logging for each subscription
-        self.get_logger().info("SETUP COMPLETE: Subscribed to multiple pose topics for redundant movement detection")
+        self.get_logger().error("EMERGENCY FIX: Subscribed to ALL possible movement detection topics")
             
         # Track TF directly for additional movement detection
         self.tf_subscriber = self.create_timer(0.1, self.check_tf_callback)  # 10Hz TF checks
@@ -1034,6 +1058,148 @@ class ZedOccupancyGridNode(Node):
                 # Still try to publish
                 self.publish_occupancy_grid()
     
+    def odom_callback(self, odom_msg):
+        """Process odometry messages to detect camera movement"""
+        # Extract position from odometry message
+        pos = odom_msg.pose.pose.position
+        
+        # Log the odometry position
+        self.get_logger().error(f"!!! ODOM DATA RECEIVED !!! Position: ({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f})")
+        
+        # Always force an update with odometry data
+        try:
+            # Mark as moving - critical for grid updates
+            self.camera_motion_detected = True
+            
+            # Force process depth data if available
+            if hasattr(self, 'latest_depth_image') and self.latest_depth_image is not None:
+                # Try to get map->camera transform
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        self.map_frame,
+                        self.camera_frame,
+                        rclpy.time.Time(),
+                        rclpy.duration.Duration(seconds=0.1)
+                    )
+                    
+                    # Force a grid update with latest transform
+                    self.get_logger().error("*** IMMEDIATE UPDATE FROM ODOM CALLBACK ***")
+                    self.update_grid_from_depth(self.latest_depth_image, transform)
+                    self.publish_occupancy_grid()
+                except Exception as e:
+                    self.get_logger().error(f"Error getting transform in odom callback: {str(e)}")
+        except Exception as e:
+            self.get_logger().error(f"Error in odom callback: {str(e)}")
+    
+    def imu_callback(self, imu_msg):
+        """Process IMU data to detect camera movement from acceleration"""
+        # Extract acceleration data
+        accel = imu_msg.linear_acceleration
+        
+        # Skip if acceleration is too small (noise)
+        accel_magnitude = math.sqrt(accel.x**2 + accel.y**2 + accel.z**2)
+        if accel_magnitude > 0.05:  # Any non-zero acceleration is likely movement
+            self.get_logger().error(f"!!! IMU MOVEMENT DETECTED !!! Acceleration: {accel_magnitude:.4f} m/s²")
+            
+            # Mark as moving
+            self.camera_motion_detected = True
+            
+            # Try to force update grid with latest transform and depth image
+            try:
+                if hasattr(self, 'latest_depth_image') and self.latest_depth_image is not None:
+                    transform = self.tf_buffer.lookup_transform(
+                        self.map_frame,
+                        self.camera_frame,
+                        rclpy.time.Time(),
+                        rclpy.duration.Duration(seconds=0.1)
+                    )
+                    
+                    # Force update
+                    self.get_logger().error("*** IMMEDIATE UPDATE FROM IMU CALLBACK ***")
+                    self.update_grid_from_depth(self.latest_depth_image, transform)
+                    self.publish_occupancy_grid()
+            except Exception as e:
+                self.get_logger().error(f"Error updating grid from IMU: {str(e)}")
+    
+    def twist_callback(self, twist_msg):
+        """Process velocity commands to preemptively detect camera movement"""
+        # Extract linear and angular velocities
+        linear = twist_msg.linear
+        angular = twist_msg.angular
+        
+        # Check if there's significant movement commanded
+        linear_mag = math.sqrt(linear.x**2 + linear.y**2 + linear.z**2)
+        angular_mag = math.sqrt(angular.x**2 + angular.y**2 + angular.z**2)
+        
+        if linear_mag > 0.01 or angular_mag > 0.01:  # Very small threshold
+            self.get_logger().error(f"!!! VELOCITY COMMAND DETECTED !!! Linear: {linear_mag:.4f}, Angular: {angular_mag:.4f}")
+            
+            # Mark as moving
+            self.camera_motion_detected = True
+            
+            # Try to trigger grid update
+            try:
+                if hasattr(self, 'latest_depth_image') and self.latest_depth_image is not None:
+                    transform = self.tf_buffer.lookup_transform(
+                        self.map_frame,
+                        self.camera_frame,
+                        rclpy.time.Time(),
+                        rclpy.duration.Duration(seconds=0.1)
+                    )
+                    
+                    # Force update
+                    self.update_grid_from_depth(self.latest_depth_image, transform)
+                    self.publish_occupancy_grid()
+            except Exception as e:
+                self.get_logger().error(f"Error updating grid from velocity: {str(e)}")
+    
+    def forced_movement_callback(self):
+        """
+        CRITICAL: Timer-based forced update regardless of camera movement
+        This ensures continuous grid updates even when camera movement detection fails
+        """
+        try:
+            # Force camera-moving flag to true - this is CRITICAL
+            self.camera_motion_detected = True
+            self.get_logger().error("*** FORCED MOVEMENT FLAG SET - EMERGENCY BYPASS ***")
+            
+            # Get latest transform and force grid update
+            if hasattr(self, 'latest_depth_image') and self.latest_depth_image is not None:
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        self.map_frame,
+                        self.camera_frame,
+                        rclpy.time.Time(),
+                        rclpy.duration.Duration(seconds=0.1)
+                    )
+                    
+                    # Log transform for debugging
+                    camera_pos = transform.transform.translation
+                    self.get_logger().error(f"*** FORCED UPDATE WITH POSITION: ({camera_pos.x:.4f}, {camera_pos.y:.4f}, {camera_pos.z:.4f}) ***")
+                    
+                    # Force grid update and publish
+                    self.update_grid_from_depth(self.latest_depth_image, transform)
+                    self.publish_occupancy_grid()
+                except Exception as e:
+                    self.get_logger().error(f"Error in forced update: {str(e)}")
+                    
+                    # Even if transform lookup fails, try with odom frame as fallback
+                    try:
+                        transform = self.tf_buffer.lookup_transform(
+                            'odom',
+                            self.camera_frame,
+                            rclpy.time.Time(),
+                            rclpy.duration.Duration(seconds=0.1)
+                        )
+                        
+                        # Force update with odom frame
+                        self.update_grid_from_depth(self.latest_depth_image, transform)
+                        self.publish_occupancy_grid(override_frame='odom')
+                    except Exception as e2:
+                        self.get_logger().error(f"Fallback forced update also failed: {str(e2)}")
+        except Exception as e:
+            self.get_logger().error(f"Error in forced movement callback: {str(e)}")
+            
     def camera_monitor_callback(self):
         """Log camera position and status periodically"""
         from std_msgs.msg import String
