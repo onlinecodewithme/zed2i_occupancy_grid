@@ -14,22 +14,193 @@ import time
 import threading
 import math
 
+# CUDA and GPU acceleration imports
+try:
+    import cupy as cp  # GPU-accelerated NumPy alternative
+    import numba
+    from numba import cuda, jit  # For creating CUDA kernels
+    CUDA_AVAILABLE = True
+except ImportError:
+    CUDA_AVAILABLE = False
+    print("WARNING: CUDA libraries not found. Falling back to CPU processing.")
+
 class ZedOccupancyGridNode(Node):
     def __init__(self):
         super().__init__('zed_occupancy_grid_node')
+
+        # Check CUDA availability for GPU acceleration
+        if CUDA_AVAILABLE:
+            self.get_logger().info("CUDA GPU acceleration is ENABLED - Using JETSON ORIN NX Acceleration!")
+            # Initialize CUDA context and compile kernels
+            self.initialize_cuda_functions()
+        else:
+            self.get_logger().warn("CUDA is not available - using CPU fallback")
+    
+    def initialize_cuda_functions(self):
+        """Initialize CUDA kernels for GPU-accelerated processing"""
+        if not CUDA_AVAILABLE:
+            return
+        
+        try:
+            # Create JIT-compiled CUDA kernels for the most computationally intensive parts
+            
+            # 1. Kernel for transforming depth points to world coordinates
+            self.transform_points_cuda = cuda.jit("""
+            def transform_points_kernel(depth_image, rotation_matrix, camera_pos, 
+                                       width, height, step, tan_fov_h, tan_fov_v,
+                                       min_depth, max_depth, result_points):
+                # Get thread indices
+                tx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
+                ty = cuda.threadIdx.y + cuda.blockIdx.y * cuda.blockDim.y
+                
+                # Check if within image bounds and step size
+                if tx < width and ty < height and tx % step == 0 and ty % step == 0:
+                    # Get depth value
+                    depth = depth_image[ty, tx]
+                    
+                    # Skip invalid depth values
+                    if not math.isfinite(depth) or depth < min_depth or depth > max_depth:
+                        result_points[ty, tx, 0] = -1000.0  # Mark as invalid
+                        return
+                        
+                    # Calculate normalized image coordinates
+                    normalized_u = (2.0 * tx / width - 1.0)
+                    normalized_v = (2.0 * ty / height - 1.0)
+                    
+                    # Calculate 3D vector from camera using field of view
+                    ray_x = normalized_u * tan_fov_h * depth
+                    ray_y = normalized_v * tan_fov_v * depth
+                    ray_z = depth
+                    
+                    # Transform ray from camera to world coordinates
+                    world_x = (rotation_matrix[0, 0] * ray_x +
+                              rotation_matrix[0, 1] * ray_y +
+                              rotation_matrix[0, 2] * ray_z) + camera_pos[0]
+                    
+                    world_y = (rotation_matrix[1, 0] * ray_x +
+                              rotation_matrix[1, 1] * ray_y +
+                              rotation_matrix[1, 2] * ray_z) + camera_pos[1]
+                    
+                    world_z = (rotation_matrix[2, 0] * ray_x +
+                              rotation_matrix[2, 1] * ray_y +
+                              rotation_matrix[2, 2] * ray_z) + camera_pos[2]
+                    
+                    # Store result in output array
+                    result_points[ty, tx, 0] = world_x
+                    result_points[ty, tx, 1] = world_y
+                    result_points[ty, tx, 2] = world_z
+            """)
+            
+            # 2. Kernel for updating grid cells (log-odds) from ray endpoints
+            self.update_endpoints_cuda = cuda.jit("""
+            def update_endpoints_kernel(world_points, grid_origin_x, grid_origin_y, 
+                                       resolution, grid_cols, grid_rows,
+                                       camera_x, camera_y, max_ray_length,
+                                       log_odds_grid, cell_height_grid, observation_count_grid,
+                                       log_odds_occupied, log_odds_min, log_odds_max,
+                                       current_alpha, temporal_filtering):
+                # Get thread indices
+                tx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
+                ty = cuda.threadIdx.y + cuda.blockIdx.y * cuda.blockDim.y
+                
+                # Check if within points array bounds
+                if tx < world_points.shape[1] and ty < world_points.shape[0]:
+                    # Get world point
+                    world_x = world_points[ty, tx, 0]
+                    world_y = world_points[ty, tx, 1]
+                    world_z = world_points[ty, tx, 2]
+                    
+                    # Skip invalid points (marked with -1000)
+                    if world_x == -1000.0:
+                        return
+                        
+                    # Skip points that are too far from camera
+                    dist_sq = (world_x - camera_x)**2 + (world_y - camera_y)**2
+                    if dist_sq > max_ray_length**2:
+                        return
+                    
+                    # Convert world coordinates to grid cell coordinates
+                    grid_x = int((world_x - grid_origin_x) / resolution)
+                    grid_y = int((world_y - grid_origin_y) / resolution)
+                    
+                    # Skip if out of grid bounds
+                    if grid_x < 0 or grid_x >= grid_cols or grid_y < 0 or grid_y >= grid_rows:
+                        return
+                    
+                    # Update log-odds for occupied cell (endpoint)
+                    if temporal_filtering:
+                        log_odds_grid[grid_y, grid_x] = (1 - current_alpha) * log_odds_grid[grid_y, grid_x] + current_alpha * log_odds_occupied
+                    else:
+                        log_odds_grid[grid_y, grid_x] += log_odds_occupied
+                    
+                    # Ensure log-odds value stays within bounds
+                    log_odds_grid[grid_y, grid_x] = max(log_odds_min, min(log_odds_max, log_odds_grid[grid_y, grid_x]))
+                    
+                    # Update height value
+                    if cell_height_grid[grid_y, grid_x] == 0:
+                        cell_height_grid[grid_y, grid_x] = world_z
+                    else:
+                        # Average with previous height
+                        cell_height_grid[grid_y, grid_x] = 0.7 * cell_height_grid[grid_y, grid_x] + 0.3 * world_z
+                    
+                    # Increment observation count - use atomic add to prevent race conditions
+                    cuda.atomic.add(observation_count_grid, (grid_y, grid_x), 1)
+            """)
+            
+            # 3. Kernel for converting log-odds to occupancy probabilities
+            self.log_odds_to_occupancy_cuda = cuda.jit("""
+            def log_odds_to_occupancy_kernel(log_odds_grid, observation_count_grid, min_observations,
+                                            occupied_threshold, free_threshold, grid_data):
+                # Get thread indices
+                tx = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
+                ty = cuda.threadIdx.y + cuda.blockIdx.y * cuda.blockDim.y
+                
+                # Check if within grid bounds
+                if tx < log_odds_grid.shape[1] and ty < log_odds_grid.shape[0]:
+                    # Get grid index
+                    idx = ty * log_odds_grid.shape[1] + tx
+                    
+                    # Default to unknown (-1)
+                    grid_data[idx] = -1
+                    
+                    # Check if cell has enough observations
+                    if observation_count_grid[ty, tx] >= min_observations:
+                        log_odds = log_odds_grid[ty, tx]
+                        
+                        # Classify cell based on log-odds
+                        if log_odds > occupied_threshold:
+                            grid_data[idx] = 100  # Occupied
+                        elif log_odds < free_threshold:
+                            grid_data[idx] = 0    # Free
+                        else:
+                            # Convert log-odds to probability and scale to [0,100]
+                            prob = 1.0 - (1.0 / (1.0 + cuda.exp(log_odds)))
+                            grid_data[idx] = int(prob * 100)
+            """)
+            
+            # Set up optimal block sizes for the GPU
+            self.threads_per_block = (16, 16)  # Optimize for Jetson Orin NX
+            
+            self.get_logger().info("CUDA GPU acceleration kernels compiled successfully")
+            
+        except Exception as e:
+            self.get_logger().error(f"Error initializing CUDA functions: {e}")
+            self.get_logger().warn("Falling back to CPU-based processing")
+            global CUDA_AVAILABLE
+            CUDA_AVAILABLE = False
         
         # Set ROS logging to DEBUG to get all messages
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
         
-        # EXTREME OBSTACLE ENHANCEMENT: Adjust occupancy probabilities for maximally clear walls
+        # POINT CLOUD MAP: Adjust parameters to create sparse point-based map like image 2
         # P(occupied) = 1 - 1/(1 + exp(l))
-        self.FREE_THRESHOLD = -1.0   # ENHANCED: Higher threshold for definite free cells (more white space)
-        self.OCCUPIED_THRESHOLD = 0.5 # ENHANCED: Even lower threshold to make walls appear immediately
-        self.LOG_ODDS_PRIOR = 0.0     # log-odds of prior probability (0.5)
-        self.LOG_ODDS_FREE = -1.2     # ENHANCED: Stronger free cell updates for definite free space
-        self.LOG_ODDS_OCCUPIED = 6.0  # ENHANCED: ULTRA aggressive obstacle marking for solid walls
-        self.LOG_ODDS_MIN = -3.0      # ENHANCED: Higher minimum to prevent excessive free marking
-        self.LOG_ODDS_MAX = 10.0      # ENHANCED: Extreme maximum for ultra-solid obstacle marking
+        self.FREE_THRESHOLD = -3.0    # CRITICAL: Much lower threshold so few cells marked as free
+        self.OCCUPIED_THRESHOLD = 0.1  # CRITICAL: Very low threshold to detect obstacles easily
+        self.LOG_ODDS_PRIOR = 0.0      # log-odds of prior probability (0.5)
+        self.LOG_ODDS_FREE = -0.1      # CRITICAL: Very weak free space marking to prevent filling
+        self.LOG_ODDS_OCCUPIED = 2.0   # Moderate obstacle marking to create point-like obstacles
+        self.LOG_ODDS_MIN = -5.0       # Standard minimum
+        self.LOG_ODDS_MAX = 5.0        # Standard maximum
         
         # Map persistence settings
         self.map_persistence_enabled = True
@@ -709,6 +880,7 @@ class ZedOccupancyGridNode(Node):
         """
         Update the log-odds grid using the depth image and camera transform.
         Uses probabilistic updates for better map quality.
+        JETSON ORIN GPU-accelerated when CUDA is available.
         """
         # DEBUG: Add logging to track function entry
         self.get_logger().info("Entering update_grid_from_depth")
@@ -734,6 +906,7 @@ class ZedOccupancyGridNode(Node):
         camera_x = transform.transform.translation.x
         camera_y = transform.transform.translation.y
         camera_z = transform.transform.translation.z
+        camera_pos = np.array([camera_x, camera_y, camera_z], dtype=np.float32)
         
         # Camera parameters - ZED2i camera
         fov_horizontal = 110.0 * np.pi / 180.0  # radians
@@ -778,66 +951,150 @@ class ZedOccupancyGridNode(Node):
         
         # Use a simpler direct approach to ensure reliability
         with self.grid_lock:  # Thread safety
-            ray_count = 0  # Track rays for debugging
+            # Track ray count for debugging
+            ray_count = 0
             
-            # Process image in a simple loop approach
-            for v in range(0, height, step):
-                for u in range(0, width, step):
-                    # Get depth value
-                    depth = depth_image[v, u]
+            # CUDA Acceleration path
+            if CUDA_AVAILABLE:
+                try:
+                    self.get_logger().info("Using JETSON ORIN CUDA acceleration for grid update")
                     
-                    # Skip invalid depth values
-                    if not np.isfinite(depth) or depth < self.min_depth or depth > self.max_depth:
-                        continue
+                    # Transfer depth image to GPU if needed
+                    if not isinstance(depth_image, cp.ndarray):
+                        d_depth_image = cp.asarray(depth_image)
+                    else:
+                        d_depth_image = depth_image
                     
-                    # Calculate normalized image coordinates
-                    normalized_u = (2.0 * u / width - 1.0)
-                    normalized_v = (2.0 * v / height - 1.0)
+                    # Allocate result array for world points
+                    d_world_points = cp.full((height, width, 3), -1000.0, dtype=cp.float32)
                     
-                    # Calculate 3D vector from camera using field of view
-                    ray_x = normalized_u * tan_fov_h * depth
-                    ray_y = normalized_v * tan_fov_v * depth
-                    ray_z = depth
+                    # Calculate CUDA grid dimensions
+                    blocks_per_grid = ((width + self.threads_per_block[0] - 1) // self.threads_per_block[0],
+                                      (height + self.threads_per_block[1] - 1) // self.threads_per_block[1])
                     
-                    # Transform ray from camera to world coordinates
-                    world_x = (rotation_matrix[0, 0] * ray_x +
-                              rotation_matrix[0, 1] * ray_y +
-                              rotation_matrix[0, 2] * ray_z) + camera_x
+                    # Move rotation matrix to GPU
+                    d_rotation_matrix = cp.asarray(rotation_matrix)
+                    d_camera_pos = cp.asarray(camera_pos)
                     
-                    world_y = (rotation_matrix[1, 0] * ray_x +
-                              rotation_matrix[1, 1] * ray_y +
-                              rotation_matrix[1, 2] * ray_z) + camera_y
+                    # Launch kernel to transform depth points to world coordinates
+                    self.transform_points_cuda[blocks_per_grid, self.threads_per_block](
+                        d_depth_image, d_rotation_matrix, d_camera_pos,
+                        width, height, step, tan_fov_h, tan_fov_v,
+                        self.min_depth, self.max_depth, d_world_points
+                    )
                     
-                    world_z = (rotation_matrix[2, 0] * ray_x +
-                              rotation_matrix[2, 1] * ray_y +
-                              rotation_matrix[2, 2] * ray_z) + camera_z
+                    # Move grid arrays to GPU if not already there
+                    d_log_odds_grid = cp.asarray(self.log_odds_grid)
+                    d_cell_height_grid = cp.asarray(self.cell_height_grid)
+                    d_observation_count_grid = cp.asarray(self.observation_count_grid)
                     
-                    # Skip points that are too far from camera
-                    if np.sqrt((world_x - camera_x)**2 + (world_y - camera_y)**2) > self.max_ray_length:
-                        continue
+                    # Launch kernel to update grid from ray endpoints
+                    self.update_endpoints_cuda[blocks_per_grid, self.threads_per_block](
+                        d_world_points, self.grid_origin_x, self.grid_origin_y,
+                        self.resolution, self.grid_cols, self.grid_rows,
+                        camera_x, camera_y, self.max_ray_length,
+                        d_log_odds_grid, d_cell_height_grid, d_observation_count_grid,
+                        self.LOG_ODDS_OCCUPIED, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX,
+                        self.current_alpha, self.temporal_filtering
+                    )
                     
-                    # Convert world coordinates to grid cell coordinates
-                    grid_x = int((world_x - self.grid_origin_x) / self.resolution)
-                    grid_y = int((world_y - self.grid_origin_y) / self.resolution)
+                    # Synchronize to ensure all operations are complete
+                    cp.cuda.runtime.deviceSynchronize()
                     
-                    # Skip if out of grid bounds
-                    if (grid_x < 0 or grid_x >= self.grid_cols or
-                        grid_y < 0 or grid_y >= self.grid_rows):
-                        continue
+                    # Copy results back to CPU
+                    self.log_odds_grid = d_log_odds_grid.get()
+                    self.cell_height_grid = d_cell_height_grid.get()
+                    self.observation_count_grid = d_observation_count_grid.get()
                     
-                    # Bresenham ray-tracing from camera to point
-                    # This marks cells along the ray as free, and the endpoint as occupied
-                    self.raytrace_bresenham(
-                        camera_grid_x, camera_grid_y,
-                        grid_x, grid_y, world_z)
+                    # Count valid rays for debugging
+                    ray_count = cp.sum(d_world_points[:, :, 0] != -1000.0).get()
                     
-                    ray_count += 1
+                    self.get_logger().info(f"CUDA GPU accelerated: Processed {ray_count} rays using Jetson Orin")
+                    
+                except Exception as e:
+                    self.get_logger().error(f"Error in CUDA acceleration: {e}")
+                    self.get_logger().warn("Falling back to CPU implementation")
+                    
+                    # Fall back to CPU implementation
+                    ray_count = self._update_grid_cpu(
+                        depth_image, camera_grid_x, camera_grid_y, 
+                        height, width, step, rotation_matrix,
+                        camera_x, camera_y, camera_z, tan_fov_h, tan_fov_v
+                    )
+            else:
+                # CPU implementation - use the standard algorithm
+                ray_count = self._update_grid_cpu(
+                    depth_image, camera_grid_x, camera_grid_y, 
+                    height, width, step, rotation_matrix,
+                    camera_x, camera_y, camera_z, tan_fov_h, tan_fov_v
+                )
             
-            # DEBUG: Log how many rays were processed only if significant
+            # DEBUG: Log how many rays were processed
             if ray_count > 0:
                 self.get_logger().info(f"Processed {ray_count} rays in update_grid_from_depth")
             else:
                 self.get_logger().warn("No valid rays processed! Check depth data and transforms.")
+                
+    def _update_grid_cpu(self, depth_image, camera_grid_x, camera_grid_y, 
+                          height, width, step, rotation_matrix,
+                          camera_x, camera_y, camera_z, tan_fov_h, tan_fov_v):
+        """CPU implementation of the grid update (used as fallback when CUDA fails)"""
+        ray_count = 0
+        
+        # Process image in a simple loop approach
+        for v in range(0, height, step):
+            for u in range(0, width, step):
+                # Get depth value
+                depth = depth_image[v, u]
+                
+                # Skip invalid depth values
+                if not np.isfinite(depth) or depth < self.min_depth or depth > self.max_depth:
+                    continue
+                
+                # Calculate normalized image coordinates
+                normalized_u = (2.0 * u / width - 1.0)
+                normalized_v = (2.0 * v / height - 1.0)
+                
+                # Calculate 3D vector from camera using field of view
+                ray_x = normalized_u * tan_fov_h * depth
+                ray_y = normalized_v * tan_fov_v * depth
+                ray_z = depth
+                
+                # Transform ray from camera to world coordinates
+                world_x = (rotation_matrix[0, 0] * ray_x +
+                          rotation_matrix[0, 1] * ray_y +
+                          rotation_matrix[0, 2] * ray_z) + camera_x
+                
+                world_y = (rotation_matrix[1, 0] * ray_x +
+                          rotation_matrix[1, 1] * ray_y +
+                          rotation_matrix[1, 2] * ray_z) + camera_y
+                
+                world_z = (rotation_matrix[2, 0] * ray_x +
+                          rotation_matrix[2, 1] * ray_y +
+                          rotation_matrix[2, 2] * ray_z) + camera_z
+                
+                # Skip points that are too far from camera
+                if np.sqrt((world_x - camera_x)**2 + (world_y - camera_y)**2) > self.max_ray_length:
+                    continue
+                
+                # Convert world coordinates to grid cell coordinates
+                grid_x = int((world_x - self.grid_origin_x) / self.resolution)
+                grid_y = int((world_y - self.grid_origin_y) / self.resolution)
+                
+                # Skip if out of grid bounds
+                if (grid_x < 0 or grid_x >= self.grid_cols or
+                    grid_y < 0 or grid_y >= self.grid_rows):
+                    continue
+                
+                # Bresenham ray-tracing from camera to point
+                # This marks cells along the ray as free, and the endpoint as occupied
+                self.raytrace_bresenham(
+                    camera_grid_x, camera_grid_y,
+                    grid_x, grid_y, world_z)
+                
+                ray_count += 1
+                
+        return ray_count
     
     def raytrace_bresenham(self, x0, y0, x1, y1, point_height):
         """
