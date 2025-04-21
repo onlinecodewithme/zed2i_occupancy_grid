@@ -674,9 +674,9 @@ class ZedOccupancyGridNode(Node):
         rotation_matrix[2, 1] = 2.0 * (qy * qz + qx * qw)
         rotation_matrix[2, 2] = 1.0 - 2.0 * (qx * qx + qy * qy)
         
-        # Sample rays through the depth image - process a subsample for efficiency
-        # For each pixel, convert to 3D point and update log-odds grid
-        step = 4  # Process every 4th pixel for efficiency
+        # EXTREME PERFORMANCE OPTIMIZATION: Process far fewer pixels to reduce computation load
+        # This significantly increases speed while maintaining acceptable map quality
+        step = 32  # MASSIVE SPEEDUP: Process only every 32nd pixel for real-time performance
         
         with self.grid_lock:  # Thread safety
             for v in range(0, height, step):
@@ -756,11 +756,16 @@ class ZedOccupancyGridNode(Node):
         traveled = 0
         total_distance = np.sqrt(dx**2 + dy**2)
         
+        # OPTIMIZATION: Fast ray tracing with fewer operations
+        # Skip processing every point along the ray - process only every 2nd point
+        ray_sampling = 2
+        count = 0
+        
         # Ray tracing
         x, y = x0, y0
         while x != x1 or y != y1:
             # Skip updating the cell where the camera is located
-            if x != x0 or y != y0:
+            if (x != x0 or y != y0) and (count % ray_sampling == 0):
                 # Update log-odds for free cell (cells along the ray)
                 # We use temporal filtering to slowly update log-odds
                 if self.temporal_filtering:
@@ -786,6 +791,7 @@ class ZedOccupancyGridNode(Node):
                 
             # Break if we've gone too far
             traveled += 1
+            count += 1
             if traveled > total_distance:
                 break
         
