@@ -38,6 +38,8 @@ class ZedOccupancyGridNode(Node):
     
     def initialize_cuda_functions(self):
         """Initialize CUDA kernels for GPU-accelerated processing"""
+        global CUDA_AVAILABLE
+        
         if not CUDA_AVAILABLE:
             return
         
@@ -186,7 +188,6 @@ class ZedOccupancyGridNode(Node):
         except Exception as e:
             self.get_logger().error(f"Error initializing CUDA functions: {e}")
             self.get_logger().warn("Falling back to CPU-based processing")
-            global CUDA_AVAILABLE
             CUDA_AVAILABLE = False
         
         # Set ROS logging to DEBUG to get all messages
