@@ -164,6 +164,9 @@ class ZedOccupancyGridNode(Node):
         # Cache the last grid message for reuse
         self.last_grid_msg = None
         
+        # Maximum speed settings
+        self.spatial_filtering = False  # DISABLED spatial filtering for maximum speed 
+        
         # Create a timer for regular map updates (even with no new data)
         self.map_timer = self.create_timer(0.1, self.publish_map_timer_callback)  # MODIFIED: 10Hz timer for more frequent updates
         
@@ -697,9 +700,9 @@ class ZedOccupancyGridNode(Node):
         rotation_matrix[2, 1] = 2.0 * (qy * qz + qx * qw)
         rotation_matrix[2, 2] = 1.0 - 2.0 * (qx * qx + qy * qy)
         
-        # SIMPLIFIED PERFORMANCE OPTIMIZATION to ensure map updates properly
-        # Use a fixed step size that's aggressive but reliable
-        step = 12  # Process 1/12 of pixels for a better balance of speed vs quality
+        # EXTREME PERFORMANCE OPTIMIZATION for real-time updates
+        # Use an extremely aggressive fixed step size for real-time performance
+        step = 24  # Process only 1/24 of pixels - focused on speed over detail
         
         # Precompute camera position in grid coordinates
         camera_grid_x = int((camera_x - self.grid_origin_x) / self.resolution)
@@ -794,9 +797,9 @@ class ZedOccupancyGridNode(Node):
         traveled = 0
         total_distance = np.sqrt(dx**2 + dy**2)
         
-        # OPTIMIZATION: Fast ray tracing with fewer operations
-        # Skip processing every point along the ray - process only every 2nd point
-        ray_sampling = 2
+        # EXTREME OPTIMIZATION: Super-fast ray tracing 
+        # Skip many points along the ray for real-time performance
+        ray_sampling = 4  # Process only every 4th point along the ray for massive speedup
         count = 0
         
         # Ray tracing
