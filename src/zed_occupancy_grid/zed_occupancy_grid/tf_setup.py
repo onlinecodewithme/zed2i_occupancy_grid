@@ -82,6 +82,28 @@ class StaticTFPublisher(Node):
     def publish_map_to_odom(self):
         """Publish the transform from map to odom frame"""
         try:
+            # First try to get the transform from the ZED's SLAM system
+            try:
+                # Check if a transform from map to odom already exists from ZED SLAM
+                transform = self.tf_buffer.lookup_transform(
+                    'map',
+                    'odom',
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.1)
+                )
+                
+                # If we get here, the transform exists - use it
+                self.get_logger().debug("Using existing map->odom transform from ZED SLAM")
+                
+                # Republish the transform to ensure it's available
+                transform.header.stamp = self.get_clock().now().to_msg()
+                self.dynamic_broadcaster.sendTransform(transform)
+                return
+                
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+                # No existing transform, we'll create one
+                pass
+            
             # This is the critical transform that was previously commented out
             # We're now publishing it dynamically to ensure the TF tree is connected
             transform = TransformStamped()

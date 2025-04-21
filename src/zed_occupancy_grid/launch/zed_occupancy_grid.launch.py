@@ -87,6 +87,10 @@ def generate_launch_description():
         'pos_tracking.floor_alignment': 'true',
         'pos_tracking.depth_min_range': '0.3',
         'pos_tracking.reset_odom_with_loop_closure': 'true',
+        # Enable the built-in loop closure detection
+        'pos_tracking.slam_enabled': 'true',
+        'pos_tracking.slam_mode': 'MEDIUM',  # MEDIUM is a good balance
+        'pos_tracking.loop_closure_enabled': 'true',  # Explicitly enable loop closure
         
         # Mapping settings
         'mapping.mapping_enabled': 'true',
