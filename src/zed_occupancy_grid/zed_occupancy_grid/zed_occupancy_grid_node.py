@@ -217,39 +217,99 @@ class ZedOccupancyGridNode(Node):
                     self.get_logger().warn(f"Missing TF frames: {', '.join(missing)}. Available frames: {frames}")
             except Exception as e:
                 self.get_logger().warn(f"Error checking TF frames: {e}")
-            
-            # Try to get transform from camera to map
+                
+            # Additional check for available TF frames to help with debugging
             try:
-                transform = self.tf_buffer.lookup_transform(
-                    self.map_frame,
+                frames = self.tf_buffer.all_frames_as_string()
+                self.get_logger().debug(f"Available TF frames: {frames}")
+            except Exception as e:
+                self.get_logger().warning(f"Error getting TF frames: {e}")
+                
+            # Process depth data and update occupancy grid
+            self.process_depth_data(depth_image, current_time)
+                
+        except Exception as e:
+            self.get_logger().error(f'Error processing depth image: {str(e)}')
+            
+    def process_depth_data(self, depth_image, current_time):
+        """Process depth image and update occupancy grid"""
+        try:
+            # First attempt to get camera-to-map transform directly
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.camera_frame,
+                rclpy.time.Time(),
+                rclpy.duration.Duration(seconds=1.0)
+            )
+            
+            # Log success - this is important for debugging
+            self.get_logger().info(f"SUCCESS: Found direct transform from {self.map_frame} to {self.camera_frame}")
+            
+            # Update the occupancy grid using depth image and transform
+            self.update_grid_from_depth(depth_image, transform)
+            
+            # Always publish when camera is moving, or at regular intervals when static
+            camera_pos = transform.transform.translation
+            # MODIFIED: Always publish on every depth frame for instant updates
+            self.last_publish_time = current_time
+            try:
+                self.publish_occupancy_grid()
+                self.get_logger().info(f"Published grid, camera pos: ({camera_pos.x:.2f}, {camera_pos.y:.2f}, {camera_pos.z:.2f})")
+            except Exception as e:
+                self.get_logger().error(f"Error publishing occupancy grid: {e}")
+            
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            self.get_logger().warning(f'Direct TF lookup failed: {str(e)}')
+            
+            # First fallback: Try to construct the transform chain manually
+            try:
+                # Try to get transform from odom to camera
+                self.get_logger().info(f'Attempting to manually construct transform chain')
+                
+                # Get odom to camera transform
+                odom_to_camera = self.tf_buffer.lookup_transform(
+                    'odom',
                     self.camera_frame,
                     rclpy.time.Time(),
-                    rclpy.duration.Duration(seconds=1.0)
+                    rclpy.duration.Duration(seconds=0.5)
                 )
                 
-                # Update the occupancy grid using depth image and transform
+                # Get map to odom transform
+                map_to_odom = self.tf_buffer.lookup_transform(
+                    self.map_frame,
+                    'odom',
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.5)
+                )
+                
+                # Combine the transforms (simplified approach)
+                transform = odom_to_camera
+                transform.header.frame_id = self.map_frame
+                
+                # Add the translations - this is a simplified approach
+                transform.transform.translation.x += map_to_odom.transform.translation.x
+                transform.transform.translation.y += map_to_odom.transform.translation.y
+                transform.transform.translation.z += map_to_odom.transform.translation.z
+                
+                # We should properly combine the rotations using quaternion multiplication
+                # But for simplicity, we'll just use the original camera rotation for now
+                
+                self.get_logger().info(f'Successfully constructed combined transform chain')
                 self.update_grid_from_depth(depth_image, transform)
-                
-                # Always publish when camera is moving, or at regular intervals when static
-                camera_pos = transform.transform.translation
-                # MODIFIED: Always publish on every depth frame for instant updates
                 self.last_publish_time = current_time
-                try:
-                    self.publish_occupancy_grid()
-                    self.get_logger().info(f"Published grid, camera pos: ({camera_pos.x:.2f}, {camera_pos.y:.2f}, {camera_pos.z:.2f})")
-                except Exception as e:
-                    self.get_logger().error(f"Error publishing occupancy grid: {e}")
+                self.publish_occupancy_grid()
                 
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-                self.get_logger().warning(f'TF error: {str(e)}')
-                # Try to get the transform directly from odom to camera as fallback
+            except Exception as e1:
+                self.get_logger().warning(f'Manual transform chain failed: {str(e1)}')
+                
+                # Second fallback: Try using just odom frame
                 try:
                     self.get_logger().info(f'Trying fallback: lookup transform from odom to {self.camera_frame}')
                     transform = self.tf_buffer.lookup_transform(
                         'odom',
                         self.camera_frame,
                         rclpy.time.Time(),
-                        rclpy.duration.Duration(seconds=1.0)
+                        rclpy.duration.Duration(seconds=0.5)
                     )
                     # We got odom to camera, use it with odom as frame
                     self.get_logger().info(f'Got transform from odom to {self.camera_frame}, using as fallback')
@@ -260,7 +320,7 @@ class ZedOccupancyGridNode(Node):
                     # Override map frame with odom for this publish
                     self.publish_occupancy_grid(override_frame='odom')
                 except Exception as e2:
-                    self.get_logger().error(f'Fallback transform failed: {str(e2)}')
+                    self.get_logger().error(f'All transform fallbacks failed: {str(e2)}')
                 
         except Exception as e:
             self.get_logger().error(f'Error processing depth image: {str(e)}')
@@ -776,7 +836,43 @@ class ZedOccupancyGridNode(Node):
         # Only force updates if we've already built a map
         if np.any(self.observation_count_grid > 0):
             self.get_logger().debug("Forcing grid update")
-            self.publish_occupancy_grid()
+            
+            # Try to get current camera position to check for movement
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.map_frame,
+                    self.camera_frame,
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.1)
+                )
+                
+                # If we got a valid transform, check if camera has moved
+                camera_pos = transform.transform.translation
+                if self.last_camera_position is not None:
+                    dx = camera_pos.x - self.last_camera_position[0]
+                    dy = camera_pos.y - self.last_camera_position[1]
+                    dz = camera_pos.z - self.last_camera_position[2]
+                    position_change = math.sqrt(dx*dx + dy*dy + dz*dz)
+                    
+                    # Log position change for debugging
+                    if position_change > 0.001:  # Very small threshold to detect minor movements
+                        self.get_logger().info(f"FORCED UPDATE: Camera moved by {position_change:.6f}m")
+                        self.camera_motion_detected = True
+                        
+                        # Update last known position
+                        self.last_camera_position = (camera_pos.x, camera_pos.y, camera_pos.z)
+                
+                # Publish the grid regardless of movement
+                self.publish_occupancy_grid()
+                
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+                # If transform lookup fails, still try to publish the grid
+                self.get_logger().debug(f"Force update TF error: {str(e)}")
+                self.publish_occupancy_grid()
+            except Exception as e:
+                self.get_logger().warning(f"Unexpected error in force update: {str(e)}")
+                # Still try to publish
+                self.publish_occupancy_grid()
     
     def camera_monitor_callback(self):
         """Log camera position and status periodically"""

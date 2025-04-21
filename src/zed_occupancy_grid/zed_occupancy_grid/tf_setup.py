@@ -6,15 +6,28 @@ from geometry_msgs.msg import TransformStamped
 from tf2_ros import StaticTransformBroadcaster
 
 
+import tf2_ros
+from rclpy.duration import Duration
+from tf2_ros import TransformBroadcaster
+
 class StaticTFPublisher(Node):
     """
-    Node to publish static transforms needed for the occupancy grid to work.
+    Node to publish transforms needed for the occupancy grid to work.
     This is needed when no SLAM or localization is running to provide the transforms.
     """
 
     def __init__(self):
-        super().__init__('static_tf_publisher')
+        super().__init__('tf_publisher')
+        
+        # Static broadcaster for transforms that don't change
         self.static_broadcaster = StaticTransformBroadcaster(self)
+        
+        # Dynamic broadcaster for transforms that need to be updated
+        self.dynamic_broadcaster = TransformBroadcaster(self)
+        
+        # Create TF buffer for lookup operations
+        self.tf_buffer = tf2_ros.Buffer(Duration(seconds=10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         
         # Publish necessary static transforms
         tf_transforms = []
@@ -22,29 +35,51 @@ class StaticTFPublisher(Node):
         # IMPORTANT: We need to ensure a proper TF tree for occupancy grid mapping
         self.get_logger().info('Setting up TF transforms for occupancy grid')
         
-        # Map to odom transform - DISABLING this as it conflicts with ZED's built-in SLAM
-        # map_to_odom = self.create_transform('map', 'odom', 0.0, 0.0, 0.0)
-        # tf_transforms.append(map_to_odom)
-        
         # Add a ground frame for visualization
         map_to_ground = self.create_transform('map', 'ground', 0.0, 0.0, -0.3)
         tf_transforms.append(map_to_ground)
         
         # Add fallback transforms that might be missing
-        # We need to ensure the connection from odom to camera frames exists
         # Only used if ZED node doesn't publish these
-        odom_to_base = self.create_transform('odom', 'zed_camera_link', 0.0, 0.0, 0.0)
-        tf_transforms.append(odom_to_base)
-        
-        # Camera base to left camera frame transform
-        # This matches the ZED camera's internal calibration
         base_to_left = self.create_transform('zed_camera_link', 'zed_left_camera_frame', 0.01, -0.06, -0.015)
         tf_transforms.append(base_to_left)
         
-        # Publish all transforms
+        # Publish all static transforms
         self.static_broadcaster.sendTransform(tf_transforms)
         self.get_logger().info('Published static transforms for occupancy grid')
+        
+        # The critical map-to-odom transform needs to be published dynamically
+        # This will be updated at regular intervals to ensure the TF tree is connected
+        self.map_odom_timer = self.create_timer(0.1, self.publish_map_to_odom)
+        
+        # Initialize last known position from camera to map
+        self.last_odom_pose = None
 
+    def publish_map_to_odom(self):
+        """Publish the transform from map to odom frame"""
+        try:
+            # This is the critical transform that was previously commented out
+            # We're now publishing it dynamically to ensure the TF tree is connected
+            transform = TransformStamped()
+            transform.header.stamp = self.get_clock().now().to_msg()
+            transform.header.frame_id = 'map'
+            transform.child_frame_id = 'odom'
+            
+            # By default, we set an identity transform (no offset)
+            transform.transform.translation.x = 0.0
+            transform.transform.translation.y = 0.0
+            transform.transform.translation.z = 0.0
+            transform.transform.rotation.x = 0.0
+            transform.transform.rotation.y = 0.0
+            transform.transform.rotation.z = 0.0
+            transform.transform.rotation.w = 1.0
+            
+            # Publish the transform
+            self.dynamic_broadcaster.sendTransform(transform)
+            
+        except Exception as e:
+            self.get_logger().warning(f"Error publishing map to odom transform: {str(e)}")
+    
     def create_transform(self, parent_frame, child_frame, x, y, z, rx=0.0, ry=0.0, rz=0.0, rw=1.0):
         """Create a transform between parent and child frames"""
         tf = TransformStamped()
