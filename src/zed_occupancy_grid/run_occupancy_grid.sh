@@ -20,7 +20,7 @@ source install/setup.bash
 export DISPLAY=:1
 
 # Set CUDA environment variables for GPU acceleration
-export NUMBA_CUDA_DRIVER=/usr/lib/x86_64-linux-gnu/libcuda.so
+# Let the script auto-detect the CUDA driver path
 export CUDA_VISIBLE_DEVICES=0
 export NUMBA_CUDA_ENABLE_CUDASIM=0
 export NUMBA_CUDA_ARRAY_INTERFACE_SYNC=1

@@ -10,25 +10,73 @@ import numpy as np
 import math
 import time
 
+# Utility function to find CUDA driver
+def find_cuda_driver():
+    import os
+    
+    # List of common paths for libcuda.so on different Linux distributions
+    common_paths = [
+        '/usr/lib/x86_64-linux-gnu/libcuda.so',
+        '/usr/lib/aarch64-linux-gnu/libcuda.so',  # For ARM64 (Jetson)
+        '/usr/lib/libcuda.so',
+        '/usr/lib64/libcuda.so',
+        '/opt/cuda/lib64/libcuda.so',
+        # Add more paths as needed
+    ]
+    
+    # Check if NUMBA_CUDA_DRIVER is set in environment, use that first
+    driver_path = os.environ.get('NUMBA_CUDA_DRIVER')
+    if driver_path and os.path.exists(driver_path):
+        print(f"Using CUDA driver from environment variable: {driver_path}")
+        return driver_path
+    elif driver_path:
+        print(f"Warning: NUMBA_CUDA_DRIVER is set to {driver_path} but file doesn't exist")
+    
+    # Check common paths
+    for path in common_paths:
+        if os.path.exists(path):
+            print(f"Found CUDA driver at: {path}")
+            # Set environment variable for numba
+            os.environ['NUMBA_CUDA_DRIVER'] = path
+            return path
+    
+    print("No CUDA driver found in common locations")
+    return None
+
 # CUDA imports
 try:
+    # Try to find CUDA driver first
+    cuda_driver = find_cuda_driver()
+    if cuda_driver is None:
+        print("❌ CUDA driver not found. GPU acceleration will not be available.")
+        raise ImportError("CUDA driver not found")
+    
     import cupy as cp
     from numba import cuda
     import numba
     
-    CUDA_AVAILABLE = True
-    print("✅ CUDA libraries successfully imported in acceleration module!")
+    # ANSI color codes for terminal output
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    CYAN = '\033[96m'
+    BOLD = '\033[1m'
+    END = '\033[0m'
     
-    # Print CUDA device information
-    if cuda.is_available():
+    CUDA_AVAILABLE = cuda.is_available()
+    if CUDA_AVAILABLE:
+        print(f"{GREEN}{BOLD}✅ CUDA GPU ACCELERATION ENABLED! 🚀{END}")
+        print(f"{GREEN}✅ CUDA libraries successfully imported in acceleration module!{END}")
+        
+        # Print CUDA device information
         device = cuda.get_current_device()
-        print(f"\nCUDA Device Information:")
-        print(f"Device Name: {device.name}")
-        print(f"Compute Capability: {device.compute_capability}")
-        print(f"Max Threads Per Block: {device.MAX_THREADS_PER_BLOCK}")
-        print(f"Max Block Dimensions: {device.MAX_BLOCK_DIM_X}, {device.MAX_BLOCK_DIM_Y}, {device.MAX_BLOCK_DIM_Z}")
-        print(f"Max Grid Dimensions: {device.MAX_GRID_DIM_X}, {device.MAX_GRID_DIM_Y}, {device.MAX_GRID_DIM_Z}")
-        print(f"Warp Size: {device.WARP_SIZE}")
+        print(f"\n{CYAN}{BOLD}CUDA Device Information:{END}")
+        print(f"{CYAN}Device Name: {device.name}{END}")
+        print(f"{CYAN}Compute Capability: {device.compute_capability}{END}")
+        print(f"{CYAN}Max Threads Per Block: {device.MAX_THREADS_PER_BLOCK}{END}")
+        print(f"{CYAN}Max Block Dimensions: {device.MAX_BLOCK_DIM_X}, {device.MAX_BLOCK_DIM_Y}, {device.MAX_BLOCK_DIM_Z}{END}")
+        print(f"{CYAN}Max Grid Dimensions: {device.MAX_GRID_DIM_X}, {device.MAX_GRID_DIM_Y}, {device.MAX_GRID_DIM_Z}{END}")
+        print(f"{CYAN}Warp Size: {device.WARP_SIZE}{END}")
         
         # Recommended block size based on device
         if device.compute_capability[0] >= 8:  # Ampere or newer
@@ -37,9 +85,16 @@ try:
             RECOMMENDED_BLOCK_SIZE = (16, 16)
             
         print(f"Recommended Thread Block Size: {RECOMMENDED_BLOCK_SIZE}")
-except ImportError:
+    else:
+        CUDA_AVAILABLE = False
+        print(f"{RED}{BOLD}❌ CUDA IS NOT AVAILABLE - USING CPU FALLBACK ❌{END}")
+        print(f"{RED}GPU acceleration will not be available.{END}")
+        RECOMMENDED_BLOCK_SIZE = (16, 16)  # Default value for when CUDA is not available
+except ImportError as e:
     CUDA_AVAILABLE = False
-    print("❌ CUDA libraries not found. GPU acceleration will not be available.")
+    print(f"{RED}{BOLD}❌ CUDA LIBRARIES NOT FOUND - USING CPU FALLBACK ❌{END}")
+    print(f"{RED}Error: {e}{END}")
+    print(f"{RED}GPU acceleration will not be available.{END}")
     RECOMMENDED_BLOCK_SIZE = (16, 16)  # Default value for when CUDA is not available
 
 # Define CUDA kernels using Numba's @cuda.jit decorator

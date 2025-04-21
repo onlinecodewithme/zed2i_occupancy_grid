@@ -14,17 +14,35 @@ import time
 import threading
 import math
 
+# ANSI color codes for terminal output
+GREEN = '\033[92m'
+RED = '\033[91m'
+YELLOW = '\033[93m'
+CYAN = '\033[96m'
+BOLD = '\033[1m'
+END = '\033[0m'
+
 # CUDA and GPU acceleration imports
 try:
     from . import cuda_acceleration
     CUDA_AVAILABLE = cuda_acceleration.CUDA_AVAILABLE
     if CUDA_AVAILABLE:
-        print("✅ CUDA acceleration module imported successfully!")
+        print(f"\n{GREEN}{BOLD}========================================{END}")
+        print(f"{GREEN}{BOLD}✓ CUDA ACCELERATION ENABLED AND ACTIVE ✓{END}")
+        print(f"{GREEN}{BOLD}========================================{END}")
+        print(f"{GREEN}✓ CUDA acceleration module imported successfully!{END}")
     else:
-        print("⚠️ CUDA acceleration module imported but CUDA is not available!")
+        print(f"\n{YELLOW}{BOLD}=========================================={END}")
+        print(f"{YELLOW}{BOLD}⚠ CUDA DISABLED - USING CPU PROCESSING ⚠{END}")
+        print(f"{YELLOW}{BOLD}=========================================={END}")
+        print(f"{YELLOW}⚠ CUDA module imported but GPU not available!{END}")
 except ImportError as e:
     CUDA_AVAILABLE = False
-    print(f"WARNING: CUDA acceleration module not found - {str(e)}. Falling back to CPU processing.")
+    print(f"\n{RED}{BOLD}=========================================={END}")
+    print(f"{RED}{BOLD}❌ CUDA UNAVAILABLE - USING CPU FALLBACK ❌{END}")
+    print(f"{RED}{BOLD}=========================================={END}")
+    print(f"{RED}❌ Error: {str(e)}{END}")
+    print(f"{RED}❌ Falling back to CPU processing (slower){END}")
 
 class ZedOccupancyGridNode(Node):
     def __init__(self):

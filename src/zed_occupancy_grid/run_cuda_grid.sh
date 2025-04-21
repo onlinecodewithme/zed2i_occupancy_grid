@@ -6,7 +6,7 @@
 echo "Starting ZED Occupancy Grid with CUDA Acceleration..."
 
 # Set environment variables to enable CUDA
-export NUMBA_CUDA_DRIVER=/usr/lib/x86_64-linux-gnu/libcuda.so
+# Let the script auto-detect the CUDA driver path
 export CUDA_VISIBLE_DEVICES=0
 
 # Run the node with CUDA acceleration
