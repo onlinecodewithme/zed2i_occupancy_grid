@@ -18,8 +18,8 @@ class ZedOccupancyGridNode(Node):
     def __init__(self):
         super().__init__('zed_occupancy_grid_node')
         
-        # Set ROS logging to DEBUG to get all messages
-        self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
+        # Set ROS logging to INFO to reduce overhead from excessive logging
+        self.get_logger().set_level(rclpy.logging.LoggingSeverity.INFO)
         
         # Occupancy probabilities - using log-odds for numerical stability
         # P(occupied) = 1 - 1/(1 + exp(l))
@@ -46,6 +46,9 @@ class ZedOccupancyGridNode(Node):
             
         # Add auto-save map timer
         self.map_save_timer = self.create_timer(self.auto_save_period, self.save_map_timer_callback)
+        
+        # Add a mutex for thread safety
+        self.grid_lock = threading.Lock()
         
         # Load map from file if available
         self.load_map()
@@ -94,9 +97,9 @@ class ZedOccupancyGridNode(Node):
         # Parameters for map updates with camera motion - EXTREME SENSITIVITY FOR DYNAMIC UPDATES
         self.last_camera_position = None     # Track camera position to detect movement
         self.declare_parameter('position_change_threshold', 0.0001)  # Ultra sensitive - detect almost any change 
-        self.position_change_threshold = 0.0  # ZERO THRESHOLD - ANY MOVEMENT WILL BE DETECTED
+        self.position_change_threshold = self.get_parameter('position_change_threshold').value  # Get from param
         self.declare_parameter('rotation_change_threshold', 0.0001)  # Ultra sensitive
-        self.rotation_change_threshold = 0.0  # ZERO THRESHOLD - ANY ROTATION WILL BE DETECTED
+        self.rotation_change_threshold = self.get_parameter('rotation_change_threshold').value  # Get from param
         self.reset_cells_on_movement = True   # Enable resetting cells that become out of view
         self.camera_motion_detected = False   # Flag to indicate if camera has moved
         self.last_camera_quaternion = None    # Track camera rotation
@@ -201,6 +204,10 @@ class ZedOccupancyGridNode(Node):
             else:
                 self.get_logger().warning('No valid depth values in image')
                 return
+            
+            # IMPORTANT: ALWAYS mark as moving camera to ensure continuous updates
+            self.camera_motion_detected = True
+            self.current_alpha = self.moving_alpha  # Always use the more responsive alpha value
                 
             # Check if any TF frames are missing and log info to help debugging
             try:
@@ -304,9 +311,7 @@ class ZedOccupancyGridNode(Node):
             self.get_logger().debug(f'Published occupancy grid with frame_id: {grid_msg.header.frame_id} (camera {state})')
 
     def create_grid_msg_from_log_odds(self):
-        """Convert log-odds grid to occupancy grid message data"""
-        grid_data = []
-        
+        """Convert log-odds grid to occupancy probabilities [0,100] - using vectorized operations for speed"""
         # First apply median filter if spatial filtering is enabled
         if self.spatial_filtering:
             # Apply 3x3 median filter to reduce noise
@@ -315,28 +320,35 @@ class ZedOccupancyGridNode(Node):
         else:
             filtered_log_odds = self.log_odds_grid
             
-        # Convert log-odds to probabilities
-        for y in range(self.grid_rows):
-            for x in range(self.grid_cols):
-                log_odds = filtered_log_odds[y, x]
-                obs_count = self.observation_count_grid[y, x]
-                
-                if obs_count < self.min_observations:
-                    # If not enough observations, mark as unknown (-1)
-                    grid_data.append(-1)
-                else:
-                    if log_odds > self.OCCUPIED_THRESHOLD:
-                        # Occupied cell
-                        grid_data.append(100)
-                    elif log_odds < self.FREE_THRESHOLD:
-                        # Free cell
-                        grid_data.append(0)
-                    else:
-                        # Convert log-odds to probability [0-100]
-                        prob = 1.0 - (1.0 / (1.0 + math.exp(log_odds)))
-                        grid_data.append(int(prob * 100))
+        # Create a copy of the grid to work with
+        grid_data = np.zeros((self.grid_rows, self.grid_cols), dtype=np.int8)
         
-        return grid_data
+        # Use numpy vectorized operations for much faster processing
+        # Mark cells with insufficient observations as unknown (-1)
+        insufficient_obs_mask = self.observation_count_grid < self.min_observations
+        grid_data[insufficient_obs_mask] = -1
+        
+        # Only process cells with sufficient observations
+        process_mask = ~insufficient_obs_mask
+        
+        # Mark occupied cells (100)
+        occupied_mask = (filtered_log_odds > self.OCCUPIED_THRESHOLD) & process_mask
+        grid_data[occupied_mask] = 100
+        
+        # Mark free cells (0)
+        free_mask = (filtered_log_odds < self.FREE_THRESHOLD) & process_mask
+        grid_data[free_mask] = 0
+        
+        # Convert remaining cells from log-odds to probabilities [0-100]
+        # Only process cells that are neither occupied nor free but have sufficient observations
+        remaining_mask = process_mask & ~occupied_mask & ~free_mask
+        if np.any(remaining_mask):
+            # Vectorized conversion from log-odds to probability
+            probs = 1.0 - (1.0 / (1.0 + np.exp(filtered_log_odds[remaining_mask])))
+            grid_data[remaining_mask] = (probs * 100).astype(np.int8)
+        
+        # Flatten the grid for the message
+        return grid_data.flatten().tolist()
     
     def detect_camera_motion(self, transform):
         """
@@ -624,9 +636,10 @@ class ZedOccupancyGridNode(Node):
         # Debug - explicitly log current camera position every time we process data
         self.get_logger().info(f"CAMERA MONITOR - Current position: ({camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f})")
         
-        # Choose sampling density - always use fine sampling for better detail
-        stride_y = 6  # Fine sampling for better details
-        stride_x = 6  # Fine sampling for better details
+        # Choose sampling density - use more aggressive sampling for faster updates
+        # Increase stride to process fewer pixels but maintain reasonable detail
+        stride_y = 10  # Coarser sampling for faster processing
+        stride_x = 10  # Coarser sampling for faster processing
         
         # Lock for thread safety
         with self.grid_lock:
@@ -699,73 +712,46 @@ class ZedOccupancyGridNode(Node):
             self.get_logger().info(f"MOTION DEBUG: position_change={position_change:.6f}, threshold={self.position_change_threshold}")
             self.get_logger().info(f"MOTION DEBUG: camera at ({camera_x:.3f}, {camera_y:.3f}, {camera_z:.3f})")
             
-            if position_change > self.position_change_threshold * 5:  # 5x the threshold for significant movement
-                # For persistent mapping, we DON'T reset the grid on significant movement
-                # Instead, we integrate new data more aggressively
-                self.get_logger().info("*** SIGNIFICANT MOVEMENT DETECTED - INTEGRATING NEW DATA ***")
-                self.get_logger().info(f"*** Movement amount: {position_change:.6f} meters ***")
-                self.get_logger().info(f"*** Position: {camera_x:.4f}, {camera_y:.4f}, {camera_z:.4f} ***")
-                
-                # More strongly update occupied cells from current observation
-                occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
+            # Always update regardless of movement magnitude
+            # CRITICAL: We need a new approach to make the map update when the camera moves
+            # The issue is that the occupancy grid isn't seeing the camera position changes
+            
+            # Completely replace existing logic with a more aggressive approach
+            
+            # STEP 1: Always update *all* grid cells that we see in this frame
+            occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
+            if np.any(occupied_mask):
+                # HARD RESET occupied cells - don't blend, just set them
+                self.log_odds_grid[occupied_mask] = self.LOG_ODDS_MAX
                 num_occupied = np.sum(occupied_mask)
-                
-                if num_occupied > 0:
-                    # Update with higher confidence but don't overwrite with max weight
-                    # to allow multiple observations to refine over time
-                    self.log_odds_grid[occupied_mask] = np.maximum(
-                        self.log_odds_grid[occupied_mask] + 2.0 * self.LOG_ODDS_OCCUPIED,
-                        self.LOG_ODDS_MAX * 0.8  # Cap at 80% of max to allow refinement
-                    )
-                
-                # Update free cells from current observation
-                free_mask = (current_update == self.LOG_ODDS_FREE)
+                self.get_logger().error(f"RESET {num_occupied} occupied cells to MAX")
+            
+            # STEP 2: Much more aggressive free cell handling
+            free_mask = (current_update == self.LOG_ODDS_FREE)
+            if np.any(free_mask):
+                # Just set all free cells to minimum - no blending
+                self.log_odds_grid[free_mask] = self.LOG_ODDS_MIN
                 num_free = np.sum(free_mask)
+                self.get_logger().error(f"RESET {num_free} free cells to MIN")
+            
+            # STEP 3: Increment a frame counter for unique maps
+            if not hasattr(self, 'frame_counter'):
+                self.frame_counter = 0
+            self.frame_counter += 1
+            
+            # STEP 4: Force an immediate publish with unique timestamp to ensure update
+            current_time = self.get_clock().now().to_msg()
+            
+            # STEP 5: Always republish even if nothing changed
+            try:
+                self.publish_occupancy_grid()
+                self.get_logger().error(f"FORCED MAP UPDATE - Frame {self.frame_counter}")
+            except Exception as ex:
+                self.get_logger().error(f"Failed to publish: {ex}")
                 
-                if num_free > 0:
-                    # Use normal free update - but only update cells that aren't strongly occupied
-                    not_occupied_mask = self.log_odds_grid < self.OCCUPIED_THRESHOLD
-                    update_mask = free_mask & not_occupied_mask
-                    self.log_odds_grid[update_mask] += self.LOG_ODDS_FREE
-                
-                self.get_logger().info(f"*** Added new data: {num_occupied} occupied cells, {num_free} free cells ***")
-                
-                # Save map on significant movement
+            # Save map periodically
+            if self.frame_counter % 10 == 0:  # Every 10 frames
                 self.save_map()
-                
-                # Force republish
-                self.last_publish_time = 0
-            else:
-                # Eliminate duplicate update code
-                
-                # We need to ensure updates are happening consistently
-                # Apply more aggressive updates to ensure map builds correctly
-                
-                # Boost occupied cells more strongly
-                occupied_mask = (current_update == self.LOG_ODDS_OCCUPIED)
-                if np.any(occupied_mask):
-                    # Strongly boost occupied cells to appear immediately
-                    self.log_odds_grid[occupied_mask] = self.LOG_ODDS_MAX  # Force to maximum value
-                    num_occupied = np.sum(occupied_mask)
-                    self.get_logger().info(f"Updated {num_occupied} occupied cells")
-                
-                # Update free cells more consistently
-                free_mask = (current_update == self.LOG_ODDS_FREE)
-                if np.any(free_mask):
-                    # For already occupied cells (high log-odds), decay them slowly
-                    # For other cells, make them more definitively free
-                    high_odds_mask = (self.log_odds_grid > self.OCCUPIED_THRESHOLD) & free_mask
-                    low_odds_mask = ~high_odds_mask & free_mask
-                    
-                    if np.any(high_odds_mask):
-                        # Gentle decay for contradictions
-                        self.log_odds_grid[high_odds_mask] *= 0.9  # Gentle decay
-                        self.get_logger().info(f"Gently decayed {np.sum(high_odds_mask)} contradicting cells")
-                        
-                    if np.any(low_odds_mask):
-                        # Stronger free updates for non-contradictions
-                        self.log_odds_grid[low_odds_mask] += 2.0 * self.LOG_ODDS_FREE
-                        self.get_logger().info(f"Updated {np.sum(low_odds_mask)} free cells")
             
             # Clamp log-odds values to prevent numerical issues
             self.log_odds_grid = np.clip(self.log_odds_grid, self.LOG_ODDS_MIN, self.LOG_ODDS_MAX)
@@ -870,7 +856,19 @@ class ZedOccupancyGridNode(Node):
                 # Force camera to be considered moving
                 self.camera_motion_detected = True
                 
-                # Force a publish
+                # Update any previous position to trigger movement detection on next update
+                # This ensures that even small movements will be detected
+                if self.last_camera_position is not None:
+                    # Add a slight offset to ensure the next position will be seen as changed
+                    offset = 0.002  # 2mm offset to force detection above threshold
+                    self.last_camera_position = (
+                        self.last_camera_position[0] + offset,
+                        self.last_camera_position[1] + offset,
+                        self.last_camera_position[2]
+                    )
+                    self.get_logger().info(f"Adjusted position reference to force movement detection")
+                
+                # Force a map update
                 self.publish_occupancy_grid()
         except Exception as e:
             # Just log at debug level since this is a background operation
@@ -955,8 +953,8 @@ class ZedOccupancyGridNode(Node):
     
     def mark_ray_as_free_3d(self, start_x, start_y, end_x, end_y, current_update):
         """
-        Marks cells along a ray from start to end as free using 3D Bresenham's algorithm.
-        Updates the current_update array with negative log-odds for free cells.
+        Optimized version that marks cells along a ray as free using a faster Bresenham implementation.
+        Uses ray skipping and batch updates for better performance.
         """
         # Limit the ray length to avoid marking too much as free
         dx = end_x - start_x
@@ -975,7 +973,15 @@ class ZedOccupancyGridNode(Node):
         end_grid_x = int((end_x - self.grid_origin_x) / self.resolution)
         end_grid_y = int((end_y - self.grid_origin_y) / self.resolution)
         
-        # Bresenham's line algorithm
+        # Skip ray casting for very short rays (optimization)
+        if abs(end_grid_x - start_grid_x) <= 1 and abs(end_grid_y - start_grid_y) <= 1:
+            return
+            
+        # Use ray skipping: mark every few cells instead of every cell
+        # This significantly speeds up ray casting while maintaining a good map
+        ray_skip = 2  # Mark every 2nd cell
+        
+        # Bresenham's line algorithm - optimized version
         dx = abs(end_grid_x - start_grid_x)
         dy = abs(end_grid_y - start_grid_y)
         sx = 1 if start_grid_x < end_grid_x else -1
@@ -983,15 +989,19 @@ class ZedOccupancyGridNode(Node):
         err = dx - dy
         
         x, y = start_grid_x, start_grid_y
+        steps = 0
+        
+        # Collect cells to mark as free in batches for better performance
+        cells_to_mark = []
         
         # For each point along the line except the endpoint (which might be occupied)
         while (x != end_grid_x or y != end_grid_y):
-            if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
-                # Mark as free using negative log-odds
-                current_update[y, x] = self.LOG_ODDS_FREE
-                # Also increment observation count
-                self.observation_count_grid[y, x] += 1
+            # Only mark cells at specified skip intervals (optimization)
+            if steps % ray_skip == 0:
+                if 0 <= x < self.grid_cols and 0 <= y < self.grid_rows:
+                    cells_to_mark.append((y, x))
             
+            steps += 1
             e2 = 2 * err
             if e2 > -dy:
                 err -= dy
@@ -999,6 +1009,15 @@ class ZedOccupancyGridNode(Node):
             if e2 < dx:
                 err += dx
                 y += sy
+                
+        # Batch update the cells for better performance
+        if cells_to_mark:
+            # Extract y and x coordinates
+            y_coords, x_coords = zip(*cells_to_mark)
+            
+            # Update cells in batch operations
+            current_update[y_coords, x_coords] = self.LOG_ODDS_FREE
+            self.observation_count_grid[y_coords, x_coords] += 1
 
 
 def main(args=None):

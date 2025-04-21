@@ -20,6 +20,8 @@ def generate_launch_description():
     grid_height = LaunchConfiguration('grid_height', default='10.0')
     min_depth = LaunchConfiguration('min_depth', default='0.5')
     max_depth = LaunchConfiguration('max_depth', default='20.0')
+    position_change_threshold = LaunchConfiguration('position_change_threshold', default='0.001')
+    rotation_change_threshold = LaunchConfiguration('rotation_change_threshold', default='0.001')
     
     # Declare launch arguments
     declare_camera_model_cmd = DeclareLaunchArgument(
@@ -142,6 +144,17 @@ def generate_launch_description():
         launch_arguments=camera_params.items()
     )
     
+    # Declare additional launch arguments for movement thresholds
+    declare_position_threshold_cmd = DeclareLaunchArgument(
+        'position_change_threshold',
+        default_value='0.001',
+        description='Position change threshold for detecting camera movement (m)')
+    
+    declare_rotation_threshold_cmd = DeclareLaunchArgument(
+        'rotation_change_threshold',
+        default_value='0.001',
+        description='Rotation change threshold for detecting camera movement (rad)')
+    
     # Define our occupancy grid node with optimized parameters for dynamic updates
     occupancy_grid_node = Node(
         package='zed_occupancy_grid',
@@ -156,11 +169,11 @@ def generate_launch_description():
             'min_depth': min_depth,
             'max_depth': max_depth,
             'resolution': resolution,  # Controls grid cell size - smaller values give more detail
-            'grid_width': 15.0,  # Increased grid size for better coverage
-            'grid_height': 15.0,  # Increased grid size for better coverage
-            # More responsive movement detection thresholds
-            'position_change_threshold': 0.005,  # Smaller threshold to detect minor movements
-            'rotation_change_threshold': 0.005,  # Smaller threshold for rotation detection
+            'grid_width': grid_width,  # Use launch parameter value
+            'grid_height': grid_height,  # Use launch parameter value
+            # Use the movement detection thresholds from launch parameters
+            'position_change_threshold': position_change_threshold,
+            'rotation_change_threshold': rotation_change_threshold,
             'moving_alpha': 0.2,  # Less temporal filtering when moving (more responsive)
             'static_alpha': 0.6,  # Less temporal filtering even when static
             'min_observations': 1,  # Allow quicker updates
@@ -209,6 +222,8 @@ def generate_launch_description():
     ld.add_action(declare_grid_height_cmd)
     ld.add_action(declare_min_depth_cmd)
     ld.add_action(declare_max_depth_cmd)
+    ld.add_action(declare_position_threshold_cmd)
+    ld.add_action(declare_rotation_threshold_cmd)
     
     # Add the ZED camera launch description first to set up camera
     ld.add_action(zed_camera_launch)
