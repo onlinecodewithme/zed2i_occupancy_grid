@@ -21,15 +21,15 @@ class ZedOccupancyGridNode(Node):
         # Set ROS logging to DEBUG to get all messages
         self.get_logger().set_level(rclpy.logging.LoggingSeverity.DEBUG)
         
-        # OBSTACLE VISIBILITY ENHANCEMENT: Adjust occupancy probabilities for clearer obstacles
+        # EXTREME OBSTACLE ENHANCEMENT: Adjust occupancy probabilities for maximally clear walls
         # P(occupied) = 1 - 1/(1 + exp(l))
-        self.FREE_THRESHOLD = -1.5  # MODIFIED: Less strict threshold for free cells
-        self.OCCUPIED_THRESHOLD = 1.0  # MODIFIED: Much lower threshold to make obstacles appear faster/easier
-        self.LOG_ODDS_PRIOR = 0.0    # log-odds of prior probability (0.5)
-        self.LOG_ODDS_FREE = -0.8    # MODIFIED: Less aggressive free cell updates to prevent washing out obstacles
-        self.LOG_ODDS_OCCUPIED = 4.5 # MODIFIED: MUCH more aggressive occupied updates for strong obstacle marking
-        self.LOG_ODDS_MIN = -4.0     # MODIFIED: Less extreme minimum to keep contrast
-        self.LOG_ODDS_MAX = 8.0      # MODIFIED: Higher maximum to allow obstacles to stand out more
+        self.FREE_THRESHOLD = -1.0   # ENHANCED: Higher threshold for definite free cells (more white space)
+        self.OCCUPIED_THRESHOLD = 0.5 # ENHANCED: Even lower threshold to make walls appear immediately
+        self.LOG_ODDS_PRIOR = 0.0     # log-odds of prior probability (0.5)
+        self.LOG_ODDS_FREE = -1.2     # ENHANCED: Stronger free cell updates for definite free space
+        self.LOG_ODDS_OCCUPIED = 6.0  # ENHANCED: ULTRA aggressive obstacle marking for solid walls
+        self.LOG_ODDS_MIN = -3.0      # ENHANCED: Higher minimum to prevent excessive free marking
+        self.LOG_ODDS_MAX = 10.0      # ENHANCED: Extreme maximum for ultra-solid obstacle marking
         
         # Map persistence settings
         self.map_persistence_enabled = True
