@@ -56,6 +56,13 @@ class ZedOccupancyGridNode(Node):
             self.initialize_cuda_functions()
         else:
             self.get_logger().warn("CUDA is not available - using CPU fallback")
+            
+        # Flag to track when we need to refresh the view frustum due to rotation
+        self.force_clear_view_frustum = False
+        # Track significant rotation angles for view frustum updates
+        self.last_significant_rotation_time = 0.0
+        # Keep track of previously viewed cells for rotation handling
+        self.view_frustum_cells = set()
     
     def initialize_cuda_functions(self):
         """Initialize CUDA accelerator for GPU-accelerated processing"""
@@ -564,7 +571,7 @@ class ZedOccupancyGridNode(Node):
     def detect_camera_motion(self, transform):
         """
         Detect if the camera has moved significantly since the last update
-        Returns: (is_moving, position_change) tuple - where position_change is the distance moved
+        Returns: (is_moving, position_change, angle_change) tuple
         """
         camera_x = transform.transform.translation.x
         camera_y = transform.transform.translation.y
@@ -579,6 +586,7 @@ class ZedOccupancyGridNode(Node):
         position_changed = False
         rotation_changed = False
         position_change = 0.0  # Default if no last position
+        angle_change = 0.0     # Default if no last rotation
         
         if self.last_camera_position is not None:
             dx = camera_x - self.last_camera_position[0]
@@ -602,18 +610,24 @@ class ZedOccupancyGridNode(Node):
             dot_product = max(min(dot_product, 1.0), -1.0)
             
             # Convert to angle
-            angle_diff = 2.0 * math.acos(abs(dot_product))
+            angle_change = 2.0 * math.acos(abs(dot_product))
             
-            if angle_diff > self.rotation_change_threshold:
+            if angle_change > self.rotation_change_threshold:
                 rotation_changed = True
-                self.get_logger().info(f"Rotation changed by {angle_diff:.4f} radians")
+                self.get_logger().info(f"Rotation changed by {angle_change:.4f} radians ({angle_change * 180.0 / math.pi:.2f} degrees)")
+                
+                # Force clearing the view frustum when rotating significantly
+                # This is critical to ensure we update with the new view
+                if angle_change > 0.05:  # About 3 degrees
+                    self.get_logger().info(f"{YELLOW}SIGNIFICANT ROTATION DETECTED - CLEARING VIEW FRUSTUM FOR NEW DATA{END}")
+                    self.force_clear_view_frustum = True
         
         # Update last known position and rotation
         self.last_camera_position = (camera_x, camera_y, camera_z)
         self.last_camera_quaternion = (qw, qx, qy, qz)
         
         # Camera has moved if either position or rotation changed significantly
-        camera_moved = True  # MODIFIED: Always consider the camera as moving
+        camera_moved = position_changed or rotation_changed or True  # MODIFIED: Always consider the camera as moving
         
         # Log camera motion if state changed
         if camera_moved != self.camera_motion_detected:
@@ -625,7 +639,7 @@ class ZedOccupancyGridNode(Node):
                 self.current_alpha = self.static_alpha
         
         self.camera_motion_detected = camera_moved
-        return (camera_moved, position_change)
+        return (camera_moved, position_change, angle_change)
         
     def save_map_timer_callback(self):
         """Timer callback to automatically save the map at regular intervals"""

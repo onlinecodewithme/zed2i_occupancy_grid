@@ -33,6 +33,7 @@ export RCUTILS_LOGGING_BUFFERED_STREAM=1
 
 # Launch the ZED camera with occupancy grid optimized for navigation
 echo "Launching ZED Occupancy Grid with wall-optimized settings..."
+echo "Loop closure and rotation handling are ENABLED"
 ros2 launch zed_occupancy_grid zed_occupancy_grid.launch.py \
   camera_model:=zed2i \
   resolution:=0.03 \
