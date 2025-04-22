@@ -833,29 +833,95 @@ class ZedOccupancyGridNode(Node):
         # Get motion information for debugging purposes
         is_moving, position_change, angle_change = self.detect_camera_motion(transform)
         
-        # Check if we need to clear the view due to significant rotation
+        # NEW APPROACH: Instead of clearing the frustum (which causes data loss),
+        # we'll create a completely new grid when significant rotation is detected
         if self.force_clear_view_frustum:
-            self.get_logger().error(f"{RED}{BOLD}ROTATION DETECTED: CLEARING VIEW FRUSTUM AND FORCING NEW DATA{END}")
+            self.get_logger().error(f"{RED}{BOLD}SIGNIFICANT ROTATION DETECTED: CREATING NEW GRID WITH FRESH CAMERA DATA{END}")
             
-            # Get camera position in grid coordinates
+            # Create a new grid just for the current camera view
+            # This ensures we use only new data from the rotated camera
+            new_log_odds_grid = np.zeros_like(self.log_odds_grid)
+            new_observation_count_grid = np.zeros_like(self.observation_count_grid)
+            new_cell_height_grid = np.zeros_like(self.cell_height_grid)
+            
+            # Store the current grid for later merging
+            old_log_odds_grid = np.copy(self.log_odds_grid)
+            old_observation_count_grid = np.copy(self.observation_count_grid)
+            old_cell_height_grid = np.copy(self.cell_height_grid)
+            
+            # Temporarily replace the grid with our new empty grid
+            # This forces the system to use only new camera data
+            self.log_odds_grid = new_log_odds_grid
+            self.observation_count_grid = new_observation_count_grid
+            self.cell_height_grid = new_cell_height_grid
+            
+            # Process the current depth image to populate the new grid
+            # We'll process this with more detail than usual
+            height, width = depth_image.shape
+            step = 32  # Default step size
+            smaller_step = max(1, step // 4)  # Use finer resolution for initial view
+            
+            # Calculate camera position in grid coordinates
             camera_x = transform.transform.translation.x
             camera_y = transform.transform.translation.y
             camera_grid_x = int((camera_x - self.grid_origin_x) / self.resolution)
             camera_grid_y = int((camera_y - self.grid_origin_y) / self.resolution)
             
-            # Clear a region around the camera to force new data to be used
-            radius = int(3.0 / self.resolution)  # Clear 3 meters around camera
-            with self.grid_lock:
-                for y in range(max(0, camera_grid_y - radius), min(self.grid_rows, camera_grid_y + radius)):
-                    for x in range(max(0, camera_grid_x - radius), min(self.grid_cols, camera_grid_x + radius)):
-                        # Reset log-odds to prior
-                        self.log_odds_grid[y, x] = self.LOG_ODDS_PRIOR
-                        # Reset observation count (but keep 1 to prevent 'unknown')
-                        self.observation_count_grid[y, x] = 0
+            # Get camera parameters
+            fov_horizontal = 110.0 * np.pi / 180.0  # radians
+            fov_vertical = 70.0 * np.pi / 180.0     # radians
+            tan_fov_h = np.tan(fov_horizontal / 2.0)
+            tan_fov_v = np.tan(fov_vertical / 2.0)
+            
+            # Extract quaternion from transform for rotation
+            qx = transform.transform.rotation.x
+            qy = transform.transform.rotation.y
+            qz = transform.transform.rotation.z
+            qw = transform.transform.rotation.w
+            
+            # Convert quaternion to rotation matrix
+            rotation_matrix = np.zeros((3, 3), dtype=np.float32)
+            
+            # First row
+            rotation_matrix[0, 0] = 1.0 - 2.0 * (qy * qy + qz * qz)
+            rotation_matrix[0, 1] = 2.0 * (qx * qy - qz * qw)
+            rotation_matrix[0, 2] = 2.0 * (qx * qz + qy * qw)
+            
+            # Second row
+            rotation_matrix[1, 0] = 2.0 * (qx * qy + qz * qw)
+            rotation_matrix[1, 1] = 1.0 - 2.0 * (qx * qx + qz * qz)
+            rotation_matrix[1, 2] = 2.0 * (qy * qz - qx * qw)
+            
+            # Third row
+            rotation_matrix[2, 0] = 2.0 * (qx * qz - qy * qw)
+            rotation_matrix[2, 1] = 2.0 * (qy * qz + qx * qw)
+            rotation_matrix[2, 2] = 1.0 - 2.0 * (qx * qx + qy * qy)
+            
+            # Process just this frame with higher resolution to get good initial data
+            initial_ray_count = self._update_grid_cpu(
+                depth_image, camera_grid_x, camera_grid_y, 
+                height, width, smaller_step, rotation_matrix,
+                camera_x, camera_y, camera_z, tan_fov_h, tan_fov_v
+            )
+            
+            self.get_logger().info(f"{GREEN}Created initial grid with {initial_ray_count} rays from new camera view{END}")
+            
+            # Now merge the new grid with the old grid, but prioritize new data
+            for y in range(self.grid_rows):
+                for x in range(self.grid_cols):
+                    # If we have new observations, keep them
+                    if self.observation_count_grid[y, x] > 0:
+                        # This cell has new data, keep it
+                        pass
+                    else:
+                        # No new data, use the old data
+                        self.log_odds_grid[y, x] = old_log_odds_grid[y, x]
+                        self.observation_count_grid[y, x] = old_observation_count_grid[y, x]
+                        self.cell_height_grid[y, x] = old_cell_height_grid[y, x]
             
             # Reset the flag
             self.force_clear_view_frustum = False
-            self.get_logger().error(f"{GREEN}VIEW FRUSTUM CLEARED - NEW DEPTH DATA WILL BE USED{END}")
+            self.get_logger().error(f"{GREEN}NEW ROTATION APPROACH: Created new view and merged with existing map{END}")
             
         # For persistent mapping, we want to PRESERVE the grid and only update incrementally
         # Unless we've detected significant rotation
