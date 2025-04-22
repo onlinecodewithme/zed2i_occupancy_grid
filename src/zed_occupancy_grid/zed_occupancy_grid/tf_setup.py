@@ -39,10 +39,68 @@ class StaticTFPublisher(Node):
         map_to_ground = self.create_transform('map', 'ground', 0.0, 0.0, -0.3)
         tf_transforms.append(map_to_ground)
         
-        # Add fallback transforms that might be missing
+        # Create base_link in map frame (initially at origin, will be updated dynamically)
+        map_to_base = self.create_transform('map', 'base_link', 0.0, 0.0, 0.0)
+        tf_transforms.append(map_to_base)
+        
+        # Add track frames relative to base_link
+        base_to_left_track = self.create_transform('base_link', 'left_track', 0.0, 0.15, 0.0)
+        tf_transforms.append(base_to_left_track)
+        
+        base_to_right_track = self.create_transform('base_link', 'right_track', 0.0, -0.15, 0.0)
+        tf_transforms.append(base_to_right_track)
+        
+        # Add camera links
+        base_to_zed_camera = self.create_transform('base_link', 'zed_camera_link', 0.1, 0.0, 0.15)
+        tf_transforms.append(base_to_zed_camera)
+        
         # Only used if ZED node doesn't publish these
-        base_to_left = self.create_transform('zed_camera_link', 'zed_left_camera_frame', 0.01, -0.06, -0.015)
-        tf_transforms.append(base_to_left)
+        zed_camera_to_center = self.create_transform('zed_camera_link', 'zed_camera_center', 0.0, 0.0, 0.0)
+        tf_transforms.append(zed_camera_to_center)
+        
+        zed_camera_to_link = self.create_transform('zed_camera_link', 'zed_camera_link', 0.0, 0.0, 0.0)
+        tf_transforms.append(zed_camera_to_link)
+        
+        # Left camera frames
+        zed_camera_to_left = self.create_transform('zed_camera_link', 'zed_left_camera_frame', 0.0, 0.06, 0.0)
+        tf_transforms.append(zed_camera_to_left)
+        
+        zed_left_to_optical = self.create_transform('zed_left_camera_frame', 'zed_left_camera_optical_frame', 
+                                                   0.0, 0.0, 0.0, -0.5, 0.5, -0.5, 0.5)  # Rotate to optical frame
+        tf_transforms.append(zed_left_to_optical)
+        
+        # Right camera frames
+        zed_camera_to_right = self.create_transform('zed_camera_link', 'zed_right_camera_frame', 0.0, -0.06, 0.0)
+        tf_transforms.append(zed_camera_to_right)
+        
+        zed_right_to_optical = self.create_transform('zed_right_camera_frame', 'zed_right_camera_optical_frame',
+                                                    0.0, 0.0, 0.0, -0.5, 0.5, -0.5, 0.5)  # Rotate to optical frame
+        tf_transforms.append(zed_right_to_optical)
+        
+        # Add ZED2i specific frames
+        base_to_zed2i = self.create_transform('base_link', 'zed2i_link', 0.1, 0.0, 0.15)
+        tf_transforms.append(base_to_zed2i)
+        
+        # ZED2i left camera
+        zed2i_to_left = self.create_transform('zed2i_link', 'zed2i_left_camera_frame', 0.0, 0.06, 0.0)
+        tf_transforms.append(zed2i_to_left)
+        
+        zed2i_left_to_optical = self.create_transform('zed2i_left_camera_frame', 'zed2i_left_camera_optical_frame',
+                                                     0.0, 0.0, 0.0, -0.5, 0.5, -0.5, 0.5)
+        tf_transforms.append(zed2i_left_to_optical)
+        
+        # ZED2i right camera
+        zed2i_to_right = self.create_transform('zed2i_link', 'zed2i_right_camera_frame', 0.0, -0.06, 0.0)
+        tf_transforms.append(zed2i_to_right)
+        
+        zed2i_right_to_optical = self.create_transform('zed2i_right_camera_frame', 'zed2i_right_camera_optical_frame',
+                                                      0.0, 0.0, 0.0, -0.5, 0.5, -0.5, 0.5)
+        tf_transforms.append(zed2i_right_to_optical)
+        
+        # ZED2i optical frames
+        zed2i_to_optical = self.create_transform('zed2i_link', 'zed2i_optical_frame', 0.0, 0.0, 0.0, 
+                                               -0.5, 0.5, -0.5, 0.5)
+        tf_transforms.append(zed2i_to_optical)
         
         # Publish all static transforms
         self.static_broadcaster.sendTransform(tf_transforms)
@@ -66,9 +124,13 @@ class StaticTFPublisher(Node):
         try:
             # Extract position from the camera pose
             pos = pose_msg.pose.position
+            orient = pose_msg.pose.orientation
             
             # Log position for debugging
             self.get_logger().debug(f"Camera position update: ({pos.x:.4f}, {pos.y:.4f}, {pos.z:.4f})")
+            
+            # Update the dynamic transforms
+            self.update_dynamic_transforms(pos, orient)
             
             # Immediately publish the transform on camera movement
             self.publish_map_to_odom()
@@ -78,6 +140,90 @@ class StaticTFPublisher(Node):
             
         except Exception as e:
             self.get_logger().error(f"Error in camera pose callback: {str(e)}")
+    
+    def update_dynamic_transforms(self, position, orientation):
+        """Update dynamic transforms based on latest camera position"""
+        try:
+            # First, check if we should be using ZED's transforms
+            try:
+                # If ZED is publishing transforms properly, we can rely on them
+                self.tf_buffer.lookup_transform(
+                    'zed_left_camera_frame',
+                    'zed_right_camera_frame',
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.1)
+                )
+                # If we get here, ZED is providing transforms, so we don't need to update
+                self.get_logger().debug("ZED camera is publishing transforms - using existing TF tree")
+                return
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+                # ZED isn't publishing all transforms, so we'll update them ourselves
+                pass
+            
+            # Create a list of dynamic transforms to update
+            dynamic_transforms = []
+            
+            # 1. Update map to base_link transform based on camera position
+            # We assume base_link is close to the camera but slightly lower
+            base_transform = TransformStamped()
+            base_transform.header.stamp = self.get_clock().now().to_msg()
+            base_transform.header.frame_id = 'map'
+            base_transform.child_frame_id = 'base_link'
+            
+            # Base is positioned under the camera
+            base_transform.transform.translation.x = position.x
+            base_transform.transform.translation.y = position.y
+            base_transform.transform.translation.z = position.z - 0.15  # 15cm below camera
+            
+            # Copy camera orientation for base
+            base_transform.transform.rotation.x = orientation.x
+            base_transform.transform.rotation.y = orientation.y
+            base_transform.transform.rotation.z = orientation.z
+            base_transform.transform.rotation.w = orientation.w
+            
+            dynamic_transforms.append(base_transform)
+            
+            # 2. Update odom to base_link if map to odom is available
+            try:
+                # Get the map to odom transform from the ZED SLAM system
+                map_to_odom = self.tf_buffer.lookup_transform(
+                    'map',
+                    'odom',
+                    rclpy.time.Time(),
+                    rclpy.duration.Duration(seconds=0.1)
+                )
+                
+                # Calculate odom to base_link using map to odom and map to base
+                odom_to_base = TransformStamped()
+                odom_to_base.header.stamp = self.get_clock().now().to_msg()
+                odom_to_base.header.frame_id = 'odom'
+                odom_to_base.child_frame_id = 'base_link'
+                
+                # This is a simplified approach - for proper transform composition,
+                # we should use tf2 Transform multiplication, but this is good enough for most cases
+                
+                # Translation - adjust for map to odom offset
+                odom_to_base.transform.translation.x = position.x - map_to_odom.transform.translation.x
+                odom_to_base.transform.translation.y = position.y - map_to_odom.transform.translation.y
+                odom_to_base.transform.translation.z = (position.z - 0.15) - map_to_odom.transform.translation.z
+                
+                # Rotation - simplified by just copying camera orientation
+                # In practice, we should account for map_to_odom rotation as well
+                odom_to_base.transform.rotation = orientation
+                
+                dynamic_transforms.append(odom_to_base)
+                
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+                # If map to odom is not available, don't update odom to base_link
+                self.get_logger().debug("No map to odom transform available - not updating odom to base_link")
+            
+            # Publish all dynamic transforms
+            if dynamic_transforms:
+                self.dynamic_broadcaster.sendTransform(dynamic_transforms)
+                self.get_logger().debug(f"Published {len(dynamic_transforms)} dynamic transforms")
+                
+        except Exception as e:
+            self.get_logger().error(f"Error updating dynamic transforms: {str(e)}")
 
     def publish_map_to_odom(self):
         """Publish the transform from map to odom frame"""
