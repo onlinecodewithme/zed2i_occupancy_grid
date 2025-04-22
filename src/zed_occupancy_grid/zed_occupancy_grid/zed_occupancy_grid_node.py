@@ -831,10 +831,34 @@ class ZedOccupancyGridNode(Node):
         self.camera_motion_detected = True
         
         # Get motion information for debugging purposes
-        is_moving, position_change = self.detect_camera_motion(transform)
+        is_moving, position_change, angle_change = self.detect_camera_motion(transform)
         
+        # Check if we need to clear the view due to significant rotation
+        if self.force_clear_view_frustum:
+            self.get_logger().error(f"{RED}{BOLD}ROTATION DETECTED: CLEARING VIEW FRUSTUM AND FORCING NEW DATA{END}")
+            
+            # Get camera position in grid coordinates
+            camera_x = transform.transform.translation.x
+            camera_y = transform.transform.translation.y
+            camera_grid_x = int((camera_x - self.grid_origin_x) / self.resolution)
+            camera_grid_y = int((camera_y - self.grid_origin_y) / self.resolution)
+            
+            # Clear a region around the camera to force new data to be used
+            radius = int(3.0 / self.resolution)  # Clear 3 meters around camera
+            with self.grid_lock:
+                for y in range(max(0, camera_grid_y - radius), min(self.grid_rows, camera_grid_y + radius)):
+                    for x in range(max(0, camera_grid_x - radius), min(self.grid_cols, camera_grid_x + radius)):
+                        # Reset log-odds to prior
+                        self.log_odds_grid[y, x] = self.LOG_ODDS_PRIOR
+                        # Reset observation count (but keep 1 to prevent 'unknown')
+                        self.observation_count_grid[y, x] = 0
+            
+            # Reset the flag
+            self.force_clear_view_frustum = False
+            self.get_logger().error(f"{GREEN}VIEW FRUSTUM CLEARED - NEW DEPTH DATA WILL BE USED{END}")
+            
         # For persistent mapping, we want to PRESERVE the grid and only update incrementally
-        # Never reset, even on significant motion
+        # Unless we've detected significant rotation
         if position_change > self.position_change_threshold * 10:  # Significant movement
             self.get_logger().info(f"*** SIGNIFICANT MOVEMENT DETECTED - PRESERVING GRID ***")
             # Don't decay values, just continue accumulating observations
